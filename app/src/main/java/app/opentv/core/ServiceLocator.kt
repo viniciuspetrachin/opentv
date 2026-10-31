@@ -99,6 +99,18 @@ object ServiceLocator {
                 stalkerApi = stalkerApi,
                 http = httpClient,
                 settings = settings,
+                paceSample = {
+                    val pressure = when (MemoryGovernor.get(context).snapshot.value.pressure) {
+                        MemoryGovernor.Pressure.CRITICAL -> CatalogueBatchPacer.Pressure.CRITICAL
+                        MemoryGovernor.Pressure.ELEVATED -> CatalogueBatchPacer.Pressure.ELEVATED
+                        MemoryGovernor.Pressure.OK -> CatalogueBatchPacer.Pressure.OK
+                    }
+                    CatalogueBatchPacer.Sample(
+                        heapFreeBytes = CatalogueBatchPacer.heapFreeBytes(),
+                        pressure = pressure,
+                    )
+                },
+                onTightMemory = { MemoryGovernor.get(context).clearImages() },
             )
         }
 

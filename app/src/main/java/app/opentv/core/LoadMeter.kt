@@ -21,16 +21,20 @@ enum class LoadStep {
  * What the loading line draws: which step, how many items, and the overall fraction of every
  * step whose size is already known.
  *
- * [total] is null until the body is far enough along to estimate it, then the exact count when
- * the step ends. [fraction] is null when no step has a known size — the bar stays a spinner
- * rather than inventing a percent.
+ * [total] is null until this step has a remembered count or a byte estimate, then the exact
+ * count when the step ends. [stepFraction] is `done / total` for that step. [fraction] is the
+ * byte weight of the whole job, and stays null when no step has a known size.
  */
 data class LoadSnapshot(
     val step: LoadStep,
     val done: Int,
     val total: Int?,
     val fraction: Float?,
-)
+) {
+    /** `done / total` for [step], or null when this step has no item total yet. */
+    val stepFraction: Float?
+        get() = total?.takeIf { it > 0 }?.let { (done.toFloat() / it.toFloat()).coerceIn(0f, 1f) }
+}
 
 /**
  * Turns byte counts into one percent for a load that has several downloads.
@@ -56,6 +60,9 @@ class LoadMeter(
     private var items = 0
     private var total: Int? = null
     private var exactTotal = false
+    private var rememberedItems: Int? = null
+    /** False when bytes read have already passed [length], so that length is not the body. */
+    private var lengthTrusted = false
     private var lastEmit = 0L
 
     /** Latest numbers, including updates that were not yet pushed to the UI. */
@@ -76,8 +83,12 @@ class LoadMeter(
         }
     }
 
-    /** Start the next download of [step]. [contentLength] replaces that download's planned size. */
-    fun begin(step: LoadStep, contentLength: Long) {
+    /**
+     * Start the next download of [step]. [contentLength] replaces that download's planned size.
+     * [rememberedItems] is the count from the last successful sync of this step, shown until a
+     * byte estimate can replace it. Zero or negative means there is no memory of it.
+     */
+    fun begin(step: LoadStep, contentLength: Long, rememberedItems: Int = -1) {
         synchronized(lock) {
             val planned = plannedBytes[step]?.removeFirstOrNull() ?: -1L
             length = when {
@@ -95,8 +106,10 @@ class LoadMeter(
             this.step = step
             readBytes = 0L
             items = 0
-            total = null
             exactTotal = false
+            lengthTrusted = length > 0L
+            this.rememberedItems = rememberedItems.takeIf { it > 0 }
+            total = this.rememberedItems
             emit(force = true)
         }
     }
@@ -109,6 +122,8 @@ class LoadMeter(
         synchronized(lock) {
             this.step = step
             length = -1L
+            lengthTrusted = false
+            rememberedItems = null
             readBytes = 0L
             items = 0
             total = known.coerceAtLeast(0)
@@ -155,20 +170,26 @@ class LoadMeter(
     fun endStep(exact: Int): Long {
         synchronized(lock) {
             val active = step ?: return 0L
+            // A content length the body has already passed (compressed length, decompressed
+            // read) is not a size worth remembering. Keep the bytes actually read instead.
+            val trusted = length > 0L && lengthTrusted && readBytes <= length
             val remembered = when {
-                length > 0 -> length
+                trusted -> length
                 readBytes > 0 -> {
-                    denominator += readBytes
+                    if (length > 0L) denominator += readBytes - length
+                    else denominator += readBytes
                     readBytes
                 }
                 else -> 0L
             }
-            if (length > 0) finished += length
+            if (trusted) finished += length
             else if (readBytes > 0) finished += readBytes
             // The step's bytes are in [finished] now. Drop the in-progress read so this
             // snapshot does not count them twice.
             readBytes = 0L
             length = -1L
+            lengthTrusted = false
+            rememberedItems = null
             items = exact.coerceAtLeast(0)
             total = items
             exactTotal = true
@@ -182,21 +203,30 @@ class LoadMeter(
 
     private fun reestimate() {
         if (exactTotal) return
-        if (length <= 0L || readBytes <= 0L || items <= 0) return
-        if (readBytes > length) return
-        val estimate = ((items.toLong() * length) / readBytes).toInt().coerceAtLeast(items)
-        val shown = total
-        if (shown == null || shown == 0) {
-            total = estimate
+        if (length > 0L && readBytes > length) lengthTrusted = false
+        if (lengthTrusted && length > 0L && readBytes > 0L && items > 0) {
+            val estimate = ((items.toLong() * length) / readBytes).toInt().coerceAtLeast(items)
+            val shown = total
+            if (shown == null || shown == 0) {
+                total = estimate
+                return
+            }
+            val delta = kotlin.math.abs(estimate - shown).toDouble() / shown.toDouble()
+            if (delta >= 0.02) total = estimate
             return
         }
-        val delta = kotlin.math.abs(estimate - shown).toDouble() / shown.toDouble()
-        if (delta >= 0.02) total = estimate
+        val remembered = rememberedItems
+        total = when {
+            remembered == null -> if (lengthTrusted) total else null
+            items > remembered -> null
+            else -> remembered
+        }
     }
 
     private fun fraction(): Float? {
         if (denominator <= 0L) return null
-        val currentBytes = if (length > 0L) readBytes.coerceAtMost(length) else 0L
+        // An untrusted length would clamp the bar at 100% while the body is still arriving.
+        val currentBytes = if (length > 0L && lengthTrusted) readBytes.coerceAtMost(length) else 0L
         return ((finished + currentBytes).toFloat() / denominator.toFloat()).coerceIn(0f, 1f)
     }
 

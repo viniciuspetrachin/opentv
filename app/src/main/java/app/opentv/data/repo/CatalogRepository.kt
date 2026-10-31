@@ -7,6 +7,7 @@ package app.opentv.data.repo
 
 import android.util.Log
 import app.opentv.core.AppSettings
+import app.opentv.core.CatalogueBatchPacer
 import app.opentv.core.CountingInputStream
 import app.opentv.core.LoadMeter
 import app.opentv.core.LoadStep
@@ -129,7 +130,8 @@ internal fun collapseMovieVariants(movies: List<Movie>): List<MovieVariantGroup>
  * Channels, movies and series.
  *
  * Same principle as [EpgRepository]: a refresh that fails must never leave the user with less
- * than they started with. A large playlist is written in batches of a few hundred rows.
+ * than they started with. A large playlist is written in batches whose size follows
+ * [CatalogueBatchPacer]: small on a tight device, larger when the last write was quick.
  * [ChannelDao.deleteStale] runs only after the last batch succeeds, so a sync that dies halfway
  * keeps both the old rows and whatever was already saved.
  */
@@ -145,10 +147,24 @@ class CatalogRepository(
     private val stalkerApi: StalkerApi,
     private val http: OkHttpClient,
     private val settings: AppSettings,
+    private val paceSample: () -> CatalogueBatchPacer.Sample = {
+        CatalogueBatchPacer.Sample(
+            heapFreeBytes = CatalogueBatchPacer.heapFreeBytes(),
+            pressure = CatalogueBatchPacer.Pressure.OK,
+        )
+    },
+    private val onTightMemory: () -> Unit = {},
 ) {
 
     /** TMDB back-fill for VOD detail pages, gated on a user-supplied key. See [TmdbClient]. */
     private val tmdb = TmdbClient(http, settings)
+
+    /**
+     * One pacer for the process. [syncLive] starts it at 300 again; movies and series keep
+     * whatever size the channel scan reached, so a strong device does not drop back to 300
+     * between those steps.
+     */
+    private val pacer = CatalogueBatchPacer()
 
     /**
      * The shared client caps a call at five minutes. A large playlist spends that time writing
@@ -800,6 +816,7 @@ class CatalogRepository(
         nowUtcMillis: Long,
         meter: LoadMeter? = null,
     ): SyncResult = withContext(Dispatchers.IO) {
+        pacer.reset()
         LoadTrace.mark("syncLive start id=${source.id} kind=${source.kind}")
         try {
             val result = when (source.kind) {
@@ -949,7 +966,7 @@ class CatalogRepository(
         }
 
         var accepted = 0
-        val batch = ArrayList<Channel>(CATALOGUE_BATCH)
+        val batch = ArrayList<Channel>(pacer.size)
         val categoryNames = ArrayList<String>()
         val seenCategories = HashSet<String>()
         var categoriesWritten = 0
@@ -971,7 +988,7 @@ class CatalogRepository(
             }
             val stream = response.body?.byteStream()
                 ?: return SyncResult.Failed("The playlist was empty.", null)
-            meter?.begin(LoadStep.CHANNELS, length)
+            meter?.begin(LoadStep.CHANNELS, length, settings.loadCount(source.id, "channels"))
             val counting = CountingInputStream(stream) { read -> meter?.setBytes(read) }
             LoadTrace.mark("m3u parse start id=${source.id}")
             M3uParser.parse(counting.bufferedReader(), source.id) { channel ->
@@ -979,7 +996,8 @@ class CatalogRepository(
                 noteCategory(channel)
                 batch += channel
                 accepted++
-                if (batch.size >= CATALOGUE_BATCH) {
+                tick(meter, accepted)
+                if (batch.size >= pacer.size) {
                     flushChannels(source.id, batch, nowUtcMillis)
                     batch.clear()
                     flushCategories()
@@ -1006,7 +1024,7 @@ class CatalogRepository(
             "m3u parsed id=${source.id} channels=$accepted skipped=${header.skippedEntries} " +
                 "categories=${header.categories.size}",
         )
-        remember(source.id, "channels", meter?.endStep(accepted) ?: -1L)
+        remember(source.id, "channels", meter?.endStep(accepted) ?: -1L, accepted)
 
         if (source.epgUrl.isNullOrBlank() && !header.declaredEpgUrl.isNullOrBlank()) {
             sourceDao.update(source.copy(epgUrl = header.declaredEpgUrl))
@@ -1148,18 +1166,21 @@ class CatalogRepository(
         meter: LoadMeter?,
     ): Int {
         val seen = LongOpenSet()
-        val batch = ArrayList<Channel>(CATALOGUE_BATCH)
+        val batch = ArrayList<Channel>(pacer.size)
         var accepted = 0
         api.streamLive(
             source,
-            onLength = { length -> meter?.begin(LoadStep.CHANNELS, length) },
+            onLength = { length ->
+                meter?.begin(LoadStep.CHANNELS, length, settings.loadCount(source.id, "channels"))
+            },
             onBytes = { read -> meter?.setBytes(read) },
         ) { channel ->
             currentCoroutineContext().ensureActive()
             if (!seen.add(fnv64(channel.streamId))) return@streamLive
             batch += normalizeOne(channel, categoryNames)
             accepted++
-            if (batch.size >= CATALOGUE_BATCH) {
+            tick(meter, accepted)
+            if (batch.size >= pacer.size) {
                 flushChannels(source.id, batch, nowUtcMillis)
                 batch.clear()
                 meter?.setItems(accepted)
@@ -1171,7 +1192,7 @@ class CatalogRepository(
             meter?.setItems(accepted)
             LoadTrace.mark("xtream batch n=$accepted")
         }
-        remember(source.id, "channels", meter?.endStep(accepted) ?: -1L)
+        remember(source.id, "channels", meter?.endStep(accepted) ?: -1L, accepted)
         return accepted
     }
 
@@ -1182,26 +1203,32 @@ class CatalogRepository(
         meter: LoadMeter?,
     ) {
         val seen = LongOpenSet()
-        val batch = ArrayList<Movie>(CATALOGUE_BATCH)
+        val batch = ArrayList<Movie>(pacer.size)
         var accepted = 0
         api.streamMovies(
             source,
-            onLength = { length -> meter?.begin(LoadStep.MOVIES, length) },
+            onLength = { length ->
+                meter?.begin(LoadStep.MOVIES, length, settings.loadCount(source.id, "movies"))
+            },
             onBytes = { read -> meter?.setBytes(read) },
         ) { movie ->
             currentCoroutineContext().ensureActive()
             if (!seen.add(fnv64(movie.streamId))) return@streamMovies
             batch += movie
             accepted++
-            if (batch.size >= CATALOGUE_BATCH) {
+            tick(meter, accepted)
+            if (batch.size >= pacer.size) {
                 flushMovies(source.id, batch, syncStamp, categoryNames)
                 batch.clear()
                 meter?.setItems(accepted)
                 LoadTrace.mark("movies batch n=$accepted")
             }
         }
-        if (batch.isNotEmpty()) flushMovies(source.id, batch, syncStamp, categoryNames)
-        remember(source.id, "movies", meter?.endStep(accepted) ?: -1L)
+        if (batch.isNotEmpty()) {
+            flushMovies(source.id, batch, syncStamp, categoryNames)
+            meter?.setItems(accepted)
+        }
+        remember(source.id, "movies", meter?.endStep(accepted) ?: -1L, accepted)
     }
 
     private suspend fun writeSeries(
@@ -1211,32 +1238,90 @@ class CatalogRepository(
         meter: LoadMeter?,
     ) {
         val seen = LongOpenSet()
-        val batch = ArrayList<Series>(CATALOGUE_BATCH)
+        val batch = ArrayList<Series>(pacer.size)
         var accepted = 0
         api.streamSeries(
             source,
-            onLength = { length -> meter?.begin(LoadStep.SERIES, length) },
+            onLength = { length ->
+                meter?.begin(LoadStep.SERIES, length, settings.loadCount(source.id, "series"))
+            },
             onBytes = { read -> meter?.setBytes(read) },
         ) { item ->
             currentCoroutineContext().ensureActive()
             if (!seen.add(fnv64(item.seriesId))) return@streamSeries
             batch += item
             accepted++
-            if (batch.size >= CATALOGUE_BATCH) {
+            tick(meter, accepted)
+            if (batch.size >= pacer.size) {
                 flushSeries(source.id, batch, syncStamp, categoryNames)
                 batch.clear()
                 meter?.setItems(accepted)
                 LoadTrace.mark("series batch n=$accepted")
             }
         }
-        if (batch.isNotEmpty()) flushSeries(source.id, batch, syncStamp, categoryNames)
-        remember(source.id, "series", meter?.endStep(accepted) ?: -1L)
+        if (batch.isNotEmpty()) {
+            flushSeries(source.id, batch, syncStamp, categoryNames)
+            meter?.setItems(accepted)
+        }
+        remember(source.id, "series", meter?.endStep(accepted) ?: -1L, accepted)
+    }
+
+    private fun tick(meter: LoadMeter?, accepted: Int) {
+        if (accepted % ITEM_TICK == 0) meter?.setItems(accepted)
+    }
+
+    /**
+     * Writes [rows], and if that runs out of memory clears the image cache, cuts the batch,
+     * and retries what is not saved yet. Failing at the floor throws, and the caller keeps
+     * the rows already stored.
+     */
+    private suspend fun <T> writeRecovering(rows: List<T>, write: suspend (List<T>) -> Unit) {
+        var index = 0
+        while (index < rows.size) {
+            val take = pacer.size.coerceAtMost(rows.size - index).coerceAtLeast(1)
+            try {
+                write(rows.subList(index, index + take))
+                index += take
+            } catch (oom: OutOfMemoryError) {
+                onTightMemory()
+                val before = pacer.size
+                val next = pacer.shrink()
+                if (next >= before || take <= CatalogueBatchPacer.FLOOR) throw oom
+            }
+        }
+    }
+
+    private fun pace(rows: Int, startedNanos: Long, kind: String) {
+        val elapsedMs = (System.nanoTime() - startedNanos) / 1_000_000L
+        val next = pacer.note(rows, elapsedMs, paceSample())
+        LoadTrace.mark("$kind batch rows=$rows next=$next")
+    }
+
+    private suspend fun <T> statesFor(
+        ids: List<String>,
+        load: suspend (List<String>) -> List<T>,
+        idOf: (T) -> String,
+    ): Map<String, T> {
+        val out = HashMap<String, T>(ids.size)
+        for (part in ids.chunked(SQL_IN_LIMIT)) {
+            for (row in load(part)) out[idOf(row)] = row
+        }
+        return out
     }
 
     private suspend fun flushChannels(sourceId: Long, batch: List<Channel>, syncStamp: Long) {
         if (batch.isEmpty()) return
-        val state = channelDao.userStateForStreamIds(sourceId, batch.map { it.streamId })
-            .associateBy { it.streamId }
+        val started = System.nanoTime()
+        writeRecovering(batch) { storeChannels(sourceId, it, syncStamp) }
+        pace(batch.size, started, "channels")
+    }
+
+    private suspend fun storeChannels(sourceId: Long, batch: List<Channel>, syncStamp: Long) {
+        val state = statesFor(
+            batch.map { it.streamId },
+            { channelDao.userStateForStreamIds(sourceId, it) },
+            { it.streamId },
+        )
         val fresh = ArrayList<Channel>()
         val known = ArrayList<Channel>()
         for (channel in batch) {
@@ -1267,8 +1352,22 @@ class CatalogRepository(
         categoryNames: Map<String, String>,
     ) {
         if (batch.isEmpty()) return
-        val state = movieDao.userStateForStreamIds(sourceId, batch.map { it.streamId })
-            .associateBy { it.streamId }
+        val started = System.nanoTime()
+        writeRecovering(batch) { storeMovies(sourceId, it, syncStamp, categoryNames) }
+        pace(batch.size, started, "movies")
+    }
+
+    private suspend fun storeMovies(
+        sourceId: Long,
+        batch: List<Movie>,
+        syncStamp: Long,
+        categoryNames: Map<String, String>,
+    ) {
+        val state = statesFor(
+            batch.map { it.streamId },
+            { movieDao.userStateForStreamIds(sourceId, it) },
+            { it.streamId },
+        )
         val fresh = ArrayList<Movie>()
         val known = ArrayList<Movie>()
         val categories = LinkedHashMap<String, Category>()
@@ -1300,8 +1399,22 @@ class CatalogRepository(
         categoryNames: Map<String, String>,
     ) {
         if (batch.isEmpty()) return
-        val state = seriesDao.userStateForSeriesIds(sourceId, batch.map { it.seriesId })
-            .associateBy { it.seriesId }
+        val started = System.nanoTime()
+        writeRecovering(batch) { storeSeries(sourceId, it, syncStamp, categoryNames) }
+        pace(batch.size, started, "series")
+    }
+
+    private suspend fun storeSeries(
+        sourceId: Long,
+        batch: List<Series>,
+        syncStamp: Long,
+        categoryNames: Map<String, String>,
+    ) {
+        val state = statesFor(
+            batch.map { it.seriesId },
+            { seriesDao.userStateForSeriesIds(sourceId, it) },
+            { it.seriesId },
+        )
         val fresh = ArrayList<Series>()
         val known = ArrayList<Series>()
         val categories = LinkedHashMap<String, Category>()
@@ -1362,8 +1475,9 @@ class CatalogRepository(
         }
     }
 
-    private fun remember(sourceId: Long, step: String, bytes: Long) {
+    private fun remember(sourceId: Long, step: String, bytes: Long, count: Int) {
         settings.saveLoadBytes(sourceId, step, bytes)
+        settings.saveLoadCount(sourceId, step, count)
     }
 
     /**
@@ -1475,8 +1589,11 @@ class CatalogRepository(
     companion object {
         private const val TAG = "CatalogRepository"
 
-        /** Rows per catalogue write. Under SQLite's 999-variable cap on the state lookup. */
-        const val CATALOGUE_BATCH = 300
+        /** How often the loading line hears about a new item, between database flushes. */
+        private const val ITEM_TICK = 16
+
+        /** Bound variables per `IN` lookup. Under SQLite's 999 cap on older Android. */
+        private const val SQL_IN_LIMIT = 900
 
         /** Rows per id-cursor walk of the channel table. */
         private const val MATCH_PAGE = 500

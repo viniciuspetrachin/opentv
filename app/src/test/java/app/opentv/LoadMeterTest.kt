@@ -59,6 +59,42 @@ class LoadMeterTest {
         meter.setBytes(400)
         assertThat(meter.current!!.fraction).isNull()
         assertThat(meter.current!!.total).isNull()
+        assertThat(meter.current!!.stepFraction).isNull()
         assertThat(meter.current!!.done).isEqualTo(12)
+    }
+
+    @Test
+    fun `remembered movie count is the total until the body can estimate`() {
+        val meter = LoadMeter(minIntervalMs = 0)
+        meter.begin(LoadStep.MOVIES, -1, rememberedItems = 2_000)
+        meter.setItems(200)
+        val snap = meter.current!!
+        assertThat(snap.step).isEqualTo(LoadStep.MOVIES)
+        assertThat(snap.done).isEqualTo(200)
+        assertThat(snap.total).isEqualTo(2_000)
+        assertThat(snap.stepFraction!!.toDouble()).isWithin(0.001).of(0.1)
+    }
+
+    @Test
+    fun `bytes past the content length keep the remembered series count`() {
+        val meter = LoadMeter(minIntervalMs = 0)
+        meter.begin(LoadStep.SERIES, 100, rememberedItems = 2_000)
+        meter.setItems(200)
+        meter.setBytes(500)
+        val snap = meter.current!!
+        assertThat(snap.step).isEqualTo(LoadStep.SERIES)
+        assertThat(snap.total).isEqualTo(2_000)
+        assertThat(snap.stepFraction!!.toDouble()).isWithin(0.001).of(0.1)
+        assertThat(meter.endStep(200)).isEqualTo(500L)
+    }
+
+    @Test
+    fun `growing past a remembered count without a trustworthy length drops the total`() {
+        val meter = LoadMeter(minIntervalMs = 0)
+        meter.begin(LoadStep.CHANNELS, 100, rememberedItems = 50)
+        meter.setItems(80)
+        meter.setBytes(500)
+        assertThat(meter.current!!.total).isNull()
+        assertThat(meter.current!!.stepFraction).isNull()
     }
 }

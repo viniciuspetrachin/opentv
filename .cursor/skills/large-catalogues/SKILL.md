@@ -1,9 +1,9 @@
 ---
 name: large-catalogues
 description: >-
-  Keep OpenTV catalogues inside device RAM: streaming M3U parse, writes of 300
-  rows, paging at 2000 rows, M3U group kinds, no largeHeap, no full-table
-  SELECT. Use when editing M3uParser, M3uGroups, CatalogRepository, DAOs, the
+  Keep OpenTV catalogues inside device RAM: streaming M3U parse, adaptive
+  catalogue batches, paging at 2000 rows, M3U group kinds, no largeHeap, no
+  full-table SELECT. Use when editing M3uParser, M3uGroups, CatalogRepository, DAOs, the
   guide, Movies, Series, the channel manager, Xtream, Stalker, or EPG matching.
 ---
 
@@ -16,7 +16,8 @@ Confirmed limits, from the code:
 
 | Constant | Value | Where |
 | --- | --- | --- |
-| `CATALOGUE_BATCH` | 300 | `CatalogRepository` |
+| `CatalogueBatchPacer.START` | 300 | grows or shrinks from here |
+| `CatalogueBatchPacer.FLOOR` | 40 | smallest write after a bad batch |
 | `GUIDE_LIST_CAP` | 2000 | `ChannelsViewModel` |
 | EPG match page | 500 | `EpgRepository.MATCH_PAGE` |
 | EPG programme batch | 500 | `EpgRepository.BATCH_SIZE` |
@@ -30,8 +31,13 @@ Confirmed limits, from the code:
 - `M3uParser` emits one channel through a callback. Attributes use `indexOf`. Duplicates use
   `LongOpenSet` of FNV-1a hashes.
 - Row id is `xui:<xui-id>` or `url:<fnv of the URL>`. `tvg-id` is the guide id, not the row id.
-- Write a batch, drop it, then the next. `deleteStale` runs once, after the last batch succeeds.
-  A failure keeps old rows and whatever was already saved.
+- Write a batch, drop it, then the next. `CatalogueBatchPacer` picks the size from the last
+  write's time and from free heap. It starts at 300 and has no maximum: it keeps growing while
+  the write stays fast. Do not put a fixed 300 cap or a fixed ceiling back.
+  `streamId IN (...)` stays chunked under 999 variables. `deleteStale` runs once, after the last
+  batch succeeds. A failure keeps old rows and whatever was already saved.
+- An `OutOfMemoryError` on a write clears images, shrinks the batch, and retries the rows not
+  saved yet. At the floor it becomes `SyncResult.Failed`.
 - Catch `OutOfMemoryError` inside the sync and return `SyncResult.Failed`. Do not rethrow it
   onto the main thread.
 - Xtream live, movies and series already batch this way. Stalker live does not: it still calls

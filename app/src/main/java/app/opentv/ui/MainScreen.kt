@@ -246,10 +246,11 @@ private fun StatusBar() {
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
-            if (percent != null && snap.fraction != null) {
+            val bar = loadBarFraction(snap)
+            if (bar != null) {
                 Spacer(Modifier.height(4.dp))
                 LinearProgressIndicator(
-                    progress = { snap.fraction },
+                    progress = { bar },
                     modifier = Modifier.fillMaxWidth().height(3.dp),
                     color = MaterialTheme.colorScheme.primary,
                 )

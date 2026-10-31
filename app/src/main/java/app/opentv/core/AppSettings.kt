@@ -406,6 +406,14 @@ class AppSettings private constructor(context: Context) {
         if (bytes > 0) prefs.edit().putLong(loadBytesKey(sourceId, step), bytes).apply()
     }
 
+    /** Item count of the last successful download of [step] for [sourceId], or -1 if unknown. */
+    fun loadCount(sourceId: Long, step: String): Int =
+        prefs.getInt(loadCountKey(sourceId, step), -1)
+
+    fun saveLoadCount(sourceId: Long, step: String, count: Int) {
+        if (count > 0) prefs.edit().putInt(loadCountKey(sourceId, step), count).apply()
+    }
+
     /** Byte size of the last successful download of guide feed [feedId], or -1. */
     fun feedBytes(feedId: Long): Long = prefs.getLong("load_bytes_feed_$feedId", -1L)
 
@@ -414,6 +422,8 @@ class AppSettings private constructor(context: Context) {
     }
 
     private fun loadBytesKey(sourceId: Long, step: String) = "load_bytes_${sourceId}_$step"
+
+    private fun loadCountKey(sourceId: Long, step: String) = "load_count_${sourceId}_$step"
 
     /**
      * The user's own TMDB API key (v3 auth), stored on-device only exactly like provider

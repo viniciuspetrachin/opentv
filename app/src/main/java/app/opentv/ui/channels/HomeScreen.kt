@@ -1051,7 +1051,7 @@ private fun LoadingState(isSyncing: Boolean) {
                 }
                 Spacer(Modifier.height(12.dp))
                 Text(app.opentv.ui.loadStepLabel(snap), style = MaterialTheme.typography.headlineSmall)
-                val fraction = snap.fraction
+                val fraction = app.opentv.ui.loadBarFraction(snap)
                 if (fraction != null) {
                     Spacer(Modifier.height(20.dp))
                     LinearProgressIndicator(

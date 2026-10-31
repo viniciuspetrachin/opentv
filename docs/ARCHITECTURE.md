@@ -198,17 +198,28 @@ rows) for the guide, the channel manager and the movie and series shelves.
 
 `M3uParser.parse` reads a `BufferedReader` and calls back one channel at a time. Attributes are
 taken with `indexOf`, not a `Regex` per line. Duplicate stream ids are filtered with a
-`LongOpenSet` of 64-bit hashes. `CatalogRepository.syncM3u` writes batches of
-`CATALOGUE_BATCH` (300, under SQLite's old 999-variable cap) and calls `deleteStale` only after
-the last batch succeeds. `OutOfMemoryError` becomes `SyncResult.Failed`. It is not rethrown onto
-the main thread, and rows already written stay.
+`LongOpenSet` of 64-bit hashes. `CatalogRepository` writes one batch, drops it, then the next.
+`CatalogueBatchPacer` chooses the size: it starts at 300 and grows by about a quarter when the
+write was fast and the heap has room. There is no fixed maximum. A strong device keeps climbing
+past 1 100 for as long as each write stays cheap, and the size shrinks when the write was slow
+or memory is tight. The `streamId IN (...)` lookup is chunked under SQLite's old
+999-variable cap, so the batch itself may be larger than that. `deleteStale` runs only after
+the last batch succeeds. An `OutOfMemoryError` on a write clears the image cache, cuts the
+batch, and retries what is not saved yet. Failing at the floor becomes `SyncResult.Failed`. It
+is not rethrown onto the main thread, and rows already written stay.
 
-Xtream live, movies and series use the same batch size and the same stale-delete-after-success
-rule. Stalker live still builds the full list and calls `replaceCatalogue`. A portal the size of
+Xtream live, movies and series share that pacer and the same stale-delete-after-success rule.
+Stalker live still builds the full list and calls `replaceCatalogue`. A portal the size of
 these M3U files would not survive that path.
 
-Progress is `OpenTV.Load` and `files/load-trace.log`. Do not log the playlist URL. The user and
-password are on the query string.
+The loading line is the phase on screen: channels, then movies, then series, each as
+`done/total (percent)` of that phase. The percent is `done / total`, and the bar uses the same
+fraction, so it starts over when the phase changes. The total is the last sync's count until a
+byte estimate can replace it. A `Content-Length` the body has already passed is ignored. The
+first sync with no length and no history shows the running count and no percent.
+
+Progress is also `OpenTV.Load` and `files/load-trace.log`, including the batch size. Do not log
+the playlist URL. The user and password are on the query string.
 
 ### Where an M3U group is filed
 
