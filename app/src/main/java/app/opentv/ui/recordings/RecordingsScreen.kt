@@ -61,6 +61,7 @@ import app.opentv.data.model.Reminder
 import app.opentv.data.model.SeriesRule
 import app.opentv.recording.RecordingStorage
 import app.opentv.reminders.ReminderScheduler
+import app.opentv.ui.rememberSizedImage
 import coil.compose.AsyncImage
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -358,7 +359,7 @@ private fun RecordingRow(
         verticalAlignment = Alignment.CenterVertically,
     ) {
         AsyncImage(
-            model = recording.logoUrl,
+            model = rememberSizedImage(recording.logoUrl, 44.dp, 44.dp),
             contentDescription = null,
             modifier = Modifier.size(44.dp).clip(RoundedCornerShape(6.dp)),
         )

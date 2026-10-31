@@ -8,6 +8,7 @@ package app.opentv.recording
 import android.content.Context
 import app.opentv.core.AppSettings
 import app.opentv.data.model.Channel
+import app.opentv.data.model.GuideSlot
 import app.opentv.data.model.Programme
 import app.opentv.data.model.Recording
 import app.opentv.data.model.RecordingStatus
@@ -199,7 +200,7 @@ class RecordingEngine(
      * every matching future airing already in the guide. Airings beyond the loaded window get
      * picked up by [scheduleMatching] on the next guide refresh.
      */
-    suspend fun recordSeries(channel: Channel, programme: Programme, windowProgrammes: List<Programme>): Long {
+    suspend fun recordSeries(channel: Channel, programme: Programme, window: List<GuideSlot>): Long {
         val key = titleKeyOf(programme.title)
         val existing = repo.ruleForChannelTitle(channel.id, key)
         val ruleId = existing?.id ?: repo.addRule(
@@ -211,7 +212,13 @@ class RecordingEngine(
                 createdAtMillis = System.currentTimeMillis(),
             ),
         )
-        scheduleMatching(channel, key, ruleId, windowProgrammes)
+        // The guide only keeps titles in memory. Load the matching airings (a handful, not the
+        // whole window) so each booking still stores its description.
+        val now = System.currentTimeMillis()
+        val full = window
+            .filter { it.endUtcMillis > now && titleKeyOf(it.title) == key }
+            .map { epgRepository.programme(it.id) ?: it.asProgramme() }
+        scheduleMatching(channel, key, ruleId, full)
         return ruleId
     }
 

@@ -23,7 +23,8 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -54,9 +55,10 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import app.opentv.R
 import app.opentv.data.model.Channel
-import app.opentv.data.model.Programme
+import app.opentv.data.model.GuideSlot
 import app.opentv.data.model.shownName
 import app.opentv.ui.ChannelsViewModel
+import app.opentv.ui.rememberSizedImage
 import coil.compose.AsyncImage
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -83,12 +85,13 @@ fun GuideGrid(
     selectedKey: Any?,
     onSelectRow: (ChannelsViewModel.Row) -> Unit,
     onFocusRow: (ChannelsViewModel.Row) -> Unit,
-    onProgramme: (ChannelsViewModel.Row, Programme) -> Unit = { _, _ -> },
+    onProgramme: (ChannelsViewModel.Row, GuideSlot) -> Unit = { _, _ -> },
     onToggleFavourite: (ChannelsViewModel.Row) -> Unit = {},
     // Returns true if it handled the key (rail was hidden, so consume it); false to let normal
     // left-navigation carry focus into the already-visible rail.
     onExitLeftFromChannel: () -> Boolean = { false },
     dayOffset: Int = 0,
+    onNearEnd: () -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     val scroll = rememberScrollState()
@@ -106,7 +109,10 @@ fun GuideGrid(
             contentPadding = PaddingValues(bottom = 16.dp),
             verticalArrangement = Arrangement.spacedBy(3.dp),
         ) {
-            items(rows, key = { it.key }) { row ->
+            itemsIndexed(rows, key = { _, row -> row.key }) { index, row ->
+                if (index == rows.lastIndex) {
+                    LaunchedEffect(rows.size) { onNearEnd() }
+                }
                 GuideRow(
                     row = row,
                     windowStartMillis = windowStartMillis,
@@ -139,6 +145,7 @@ fun ChannelList(
     onFocusRow: (ChannelsViewModel.Row) -> Unit,
     onToggleFavourite: (ChannelsViewModel.Row) -> Unit = {},
     onExitLeftFromChannel: () -> Boolean = { false },
+    onNearEnd: () -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     val now = System.currentTimeMillis()
@@ -147,7 +154,10 @@ fun ChannelList(
         contentPadding = PaddingValues(vertical = 8.dp),
         verticalArrangement = Arrangement.spacedBy(3.dp),
     ) {
-        items(rows, key = { it.key }) { row ->
+        itemsIndexed(rows, key = { _, row -> row.key }) { index, row ->
+            if (index == rows.lastIndex) {
+                LaunchedEffect(rows.size) { onNearEnd() }
+            }
             ChannelListRow(
                 row = row,
                 nowMillis = now,
@@ -206,7 +216,7 @@ private fun ChannelListRow(
             )
         }
         AsyncImage(
-            model = row.primary.logoUrl,
+            model = rememberSizedImage(row.primary.logoUrl, 40.dp, 40.dp),
             contentDescription = null,
             modifier = Modifier.size(40.dp).clip(RoundedCornerShape(4.dp)),
         )
@@ -317,7 +327,7 @@ private fun GuideRow(
     isSelected: Boolean,
     onSelect: () -> Unit,
     onFocus: () -> Unit,
-    onProgramme: (Programme) -> Unit,
+    onProgramme: (GuideSlot) -> Unit,
     onToggleFavourite: () -> Unit = {},
     onExitLeft: () -> Boolean = { false },
 ) {
@@ -367,7 +377,7 @@ private fun GuideRow(
                 )
             }
             AsyncImage(
-                model = row.primary.logoUrl,
+                model = rememberSizedImage(row.primary.logoUrl, 34.dp, 34.dp),
                 contentDescription = null,
                 modifier = Modifier.size(34.dp).clip(RoundedCornerShape(4.dp)),
             )

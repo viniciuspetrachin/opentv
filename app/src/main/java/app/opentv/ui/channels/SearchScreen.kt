@@ -55,6 +55,7 @@ import app.opentv.data.model.shownName
 import app.opentv.data.parser.displayTitle
 import app.opentv.ui.ChannelsViewModel
 import app.opentv.ui.VodViewModel
+import app.opentv.ui.rememberSizedImage
 import coil.compose.AsyncImage
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -188,7 +189,7 @@ private fun VodResultRow(name: String, posterUrl: String?, subtitle: String?, on
         verticalAlignment = Alignment.CenterVertically,
     ) {
         AsyncImage(
-            model = posterUrl,
+            model = rememberSizedImage(posterUrl, 34.dp, 48.dp),
             contentDescription = null,
             modifier = Modifier.size(width = 34.dp, height = 48.dp).clip(RoundedCornerShape(6.dp)),
         )
@@ -220,7 +221,7 @@ private fun SearchResultRow(row: ChannelsViewModel.Row, onClick: () -> Unit) {
         verticalAlignment = Alignment.CenterVertically,
     ) {
         AsyncImage(
-            model = row.primary.logoUrl,
+            model = rememberSizedImage(row.primary.logoUrl, 40.dp, 40.dp),
             contentDescription = null,
             modifier = Modifier.size(40.dp).clip(RoundedCornerShape(6.dp)),
         )

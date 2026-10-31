@@ -20,6 +20,7 @@ import app.opentv.data.model.Episode
 import app.opentv.data.model.Movie
 import app.opentv.data.model.PlaybackPosition
 import app.opentv.data.model.Profile
+import app.opentv.data.model.GuideSlot
 import app.opentv.data.model.Programme
 import app.opentv.data.model.Recording
 import app.opentv.data.model.RecordingStatus
@@ -65,6 +66,15 @@ interface ChannelDao {
         WHERE hidden = 0
           AND (:sourceId IS NULL OR sourceId = :sourceId)
           AND (:categoryId IS NULL OR categoryId = :categoryId)
+          AND (
+            categoryId IS NULL OR categoryId = ''
+            OR EXISTS (
+              SELECT 1 FROM categories c
+              WHERE c.sourceId = channels.sourceId
+                AND c.id = channels.categoryId
+                AND c.kind = 'LIVE'
+            )
+          )
         ORDER BY sortIndex, displayName
         """
     )
@@ -180,7 +190,21 @@ interface ChannelDao {
      * screen tell "the guide is still building from channels on disk" apart from "nothing loaded",
      * so a failed or empty sync surfaces an error instead of spinning forever.
      */
-    @Query("SELECT COUNT(*) FROM channels WHERE hidden = 0")
+    @Query(
+        """
+        SELECT COUNT(*) FROM channels
+        WHERE hidden = 0
+          AND (
+            categoryId IS NULL OR categoryId = ''
+            OR EXISTS (
+              SELECT 1 FROM categories c
+              WHERE c.sourceId = channels.sourceId
+                AND c.id = channels.categoryId
+                AND c.kind = 'LIVE'
+            )
+          )
+        """
+    )
     fun observeVisibleCount(): Flow<Int>
 
     @Query("UPDATE channels SET favourite = :favourite WHERE id = :id")
@@ -285,6 +309,135 @@ interface ChannelDao {
 
     @Query("SELECT * FROM channels WHERE sourceId = :sourceId")
     suspend fun userStateForSource(sourceId: Long): List<Channel>
+
+    /** User state for one write batch. Never the whole source — a large playlist does not fit. */
+    @Query(
+        """
+        SELECT id, streamId, favourite, hidden, sortIndex, customName, epgOverrideId, matchedEpgId
+        FROM channels
+        WHERE sourceId = :sourceId AND streamId IN (:ids)
+        """
+    )
+    suspend fun userStateForStreamIds(sourceId: Long, ids: List<String>): List<ChannelUserState>
+
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    suspend fun insertIgnore(channels: List<Channel>)
+
+    @Update
+    suspend fun updateAll(channels: List<Channel>)
+
+    /** Next page of the matcher / re-normalise walk. Cursor is the row id, not OFFSET. */
+    @Query("SELECT * FROM channels WHERE id > :afterId ORDER BY id LIMIT :limit")
+    suspend fun pageAfterId(afterId: Long, limit: Int): List<Channel>
+
+    @Query(
+        """
+        SELECT * FROM channels
+        WHERE sourceId = :sourceId AND id > :afterId
+        ORDER BY id
+        LIMIT :limit
+        """
+    )
+    suspend fun pageForSource(sourceId: Long, afterId: Long, limit: Int): List<Channel>
+
+    /**
+     * One row per live group already stored on channels. Used when a download stops before the
+     * category table is written, so the rail can still be built from what was saved.
+     */
+    @Query(
+        """
+        SELECT categoryId, MIN(sortIndex) AS sortIndex
+        FROM channels
+        WHERE sourceId = :sourceId AND categoryId IS NOT NULL AND categoryId != ''
+        GROUP BY categoryId
+        ORDER BY sortIndex
+        """
+    )
+    suspend fun liveCategorySeeds(sourceId: Long): List<LiveCategorySeed>
+
+    @Query("SELECT COUNT(*) FROM channels")
+    suspend fun countAll(): Int
+
+    @Query(
+        """
+        SELECT COUNT(*) FROM channels
+        WHERE hidden = 0 AND (:sourceId IS NULL OR sourceId = :sourceId)
+          AND (
+            categoryId IS NULL OR categoryId = ''
+            OR EXISTS (
+              SELECT 1 FROM categories c
+              WHERE c.sourceId = channels.sourceId
+                AND c.id = channels.categoryId
+                AND c.kind = 'LIVE'
+            )
+          )
+        """
+    )
+    suspend fun countVisible(sourceId: Long?): Int
+
+    @Query(
+        """
+        SELECT COUNT(*) FROM channels
+        WHERE hidden = 0
+          AND categoryId IN (:categoryIds)
+          AND (:sourceId IS NULL OR sourceId = :sourceId)
+        """
+    )
+    suspend fun countInCategories(sourceId: Long?, categoryIds: List<String>): Int
+
+    /**
+     * One page of a category that is too big to hold at once. The cursor is
+     * `(sortIndex, id)`, so a deep page does not walk every earlier row the way OFFSET would.
+     */
+    @Query(
+        """
+        SELECT * FROM channels
+        WHERE hidden = 0
+          AND categoryId IN (:categoryIds)
+          AND (:sourceId IS NULL OR sourceId = :sourceId)
+          AND (sortIndex > :afterSort OR (sortIndex = :afterSort AND id > :afterId))
+        ORDER BY sortIndex, id
+        LIMIT :limit
+        """
+    )
+    suspend fun pageInCategories(
+        sourceId: Long?,
+        categoryIds: List<String>,
+        afterSort: Int,
+        afterId: Long,
+        limit: Int,
+    ): List<Channel>
+
+    @Query(
+        """
+        SELECT COUNT(*) FROM channels
+        WHERE (:sourceId IS NULL OR sourceId = :sourceId)
+          AND categoryId IN (:categoryIds)
+        """
+    )
+    suspend fun countInCategoriesIncludingHidden(sourceId: Long?, categoryIds: List<String>): Int
+
+    /**
+     * One page of a category, hidden rows included. Same cursor as [pageInCategories].
+     * The channel manager has to see a hidden channel to switch it back on.
+     */
+    @Query(
+        """
+        SELECT * FROM channels
+        WHERE (:sourceId IS NULL OR sourceId = :sourceId)
+          AND categoryId IN (:categoryIds)
+          AND (sortIndex > :afterSort OR (sortIndex = :afterSort AND id > :afterId))
+        ORDER BY sortIndex, id
+        LIMIT :limit
+        """
+    )
+    suspend fun pageInCategoriesIncludingHidden(
+        sourceId: Long?,
+        categoryIds: List<String>,
+        afterSort: Int,
+        afterId: Long,
+        limit: Int,
+    ): List<Channel>
 }
 
 @Dao
@@ -304,15 +457,64 @@ interface CategoryDao {
     @Upsert
     suspend fun upsertAll(categories: List<Category>)
 
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    suspend fun insertIgnore(categories: List<Category>)
+
+    @Query("DELETE FROM categories WHERE sourceId = :sourceId AND id IN (:ids)")
+    suspend fun deleteIds(sourceId: Long, ids: List<String>)
+
+    @Query("SELECT * FROM categories WHERE sourceId = :sourceId")
+    suspend fun forSource(sourceId: Long): List<Category>
+
+    /**
+     * Categories that actually have channel rows. The channel manager lists a reclassified
+     * movie or series group, because those titles still live in `channels`.
+     */
+    @Query(
+        """
+        SELECT * FROM categories c
+        WHERE EXISTS (
+          SELECT 1 FROM channels ch
+          WHERE ch.sourceId = c.sourceId AND ch.categoryId = c.id
+        )
+        ORDER BY sortIndex, name
+        """
+    )
+    fun observeWithChannels(): Flow<List<Category>>
+
     @Query("DELETE FROM categories WHERE sourceId = :sourceId")
     suspend fun deleteForSource(sourceId: Long)
+
+    @Query("SELECT COUNT(*) FROM categories WHERE sourceId = :sourceId AND kind = :kind")
+    suspend fun countFor(sourceId: Long, kind: StreamKind): Int
 }
 
 /** Projection for [CategoryDao.namesFor]. */
 data class CategoryName(val id: String, val name: String)
 
+/** The columns a catalogue batch has to preserve. See [ChannelDao.userStateForStreamIds]. */
+data class ChannelUserState(
+    val id: Long,
+    val streamId: String,
+    val favourite: Boolean,
+    val hidden: Boolean,
+    val sortIndex: Int,
+    val customName: String?,
+    val epgOverrideId: String?,
+    val matchedEpgId: String?,
+)
+
+/** Favourite flag for a movie batch. See [MovieDao.userStateForStreamIds]. */
+data class MovieUserState(val id: Long, val streamId: String, val favourite: Boolean)
+
+/** Favourite flag for a series batch. See [SeriesDao.userStateForSeriesIds]. */
+data class SeriesUserState(val id: Long, val seriesId: String, val favourite: Boolean)
+
 /** Projection for [ChannelDao.channelCountsByCategory]. */
 data class CategoryChannelCount(val sourceId: Long, val categoryId: String, val count: Int)
+
+/** One distinct `group-title` already stored on a source's channels. See [ChannelDao.liveCategorySeeds]. */
+data class LiveCategorySeed(val categoryId: String, val sortIndex: Int)
 
 @Dao
 interface EpgFeedDao {
@@ -381,6 +583,51 @@ interface ProgrammeDao {
         """
     )
     fun observeWindow(fromUtcMillis: Long, toUtcMillis: Long): Flow<List<Programme>>
+
+    /**
+     * Same window as [observeWindow], but only the columns the grid paints. Descriptions stay in
+     * the table until a record/reminder opens one row via [byId].
+     *
+     * The guide must not collect this for a large catalogue: the whole window becomes one list.
+     * Use [guideSlotsFor] in id batches instead.
+     */
+    @Query(
+        """
+        SELECT id, epgChannelId, startUtcMillis, endUtcMillis, title FROM programmes
+        WHERE endUtcMillis > :fromUtcMillis
+          AND startUtcMillis < :toUtcMillis
+        ORDER BY epgChannelId, startUtcMillis
+        """
+    )
+    fun observeGuideWindow(fromUtcMillis: Long, toUtcMillis: Long): Flow<List<GuideSlot>>
+
+    /**
+     * Guide columns for one batch of EPG channel ids. Callers keep each batch under SQLite's
+     * bound-variable cap (999 on older Android); [app.opentv.data.repo.EpgRepository] chunks at 400.
+     * Ordered like [observeGuideWindow], so each channel's slots are already start-ordered.
+     */
+    @Query(
+        """
+        SELECT id, epgChannelId, startUtcMillis, endUtcMillis, title FROM programmes
+        WHERE endUtcMillis > :fromUtcMillis
+          AND startUtcMillis < :toUtcMillis
+          AND epgChannelId IN (:epgChannelIds)
+        ORDER BY epgChannelId, startUtcMillis
+        """
+    )
+    suspend fun guideSlotsFor(
+        fromUtcMillis: Long,
+        toUtcMillis: Long,
+        epgChannelIds: List<String>,
+    ): List<GuideSlot>
+
+    /** Cheap signal that the guide table changed, so the UI can re-read in batches instead of
+     *  collecting the whole window. */
+    @Query("SELECT COUNT(*) FROM programmes")
+    fun observeCount(): Flow<Int>
+
+    @Query("SELECT * FROM programmes WHERE id = :id")
+    suspend fun byId(id: Long): Programme?
 
     /** What is on right now, for the channel list's "now playing" line. */
     @Query(
@@ -514,6 +761,61 @@ interface MovieDao {
     @Upsert
     suspend fun upsertAll(movies: List<Movie>)
 
+    @Query(
+        """
+        SELECT id, streamId, favourite FROM movies
+        WHERE sourceId = :sourceId AND streamId IN (:ids)
+        """
+    )
+    suspend fun userStateForStreamIds(sourceId: Long, ids: List<String>): List<MovieUserState>
+
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    suspend fun insertIgnore(movies: List<Movie>)
+
+    @Update
+    suspend fun updateAll(movies: List<Movie>)
+
+    @Query("DELETE FROM movies WHERE sourceId = :sourceId AND lastSeenMillis < :syncStamp")
+    suspend fun deleteStale(sourceId: Long, syncStamp: Long)
+
+    @Query("SELECT COUNT(*) FROM movies WHERE categoryId = :categoryId")
+    suspend fun countInCategory(categoryId: String): Int
+
+    @Query(
+        """
+        SELECT * FROM movies
+        WHERE categoryId = :categoryId
+          AND (addedMillis < :afterAdded OR (addedMillis = :afterAdded AND id < :afterId))
+        ORDER BY addedMillis DESC, id DESC
+        LIMIT :limit
+        """
+    )
+    suspend fun pageInCategory(
+        categoryId: String,
+        afterAdded: Long,
+        afterId: Long,
+        limit: Int,
+    ): List<Movie>
+
+    @Query(
+        """
+        SELECT * FROM movies
+        WHERE genre LIKE '%' || :token || '%'
+        ORDER BY addedMillis DESC, id DESC
+        LIMIT :limit
+        """
+    )
+    suspend fun inGenre(token: String, limit: Int): List<Movie>
+
+    @Query("SELECT genre FROM movies WHERE genre IS NOT NULL AND genre != ''")
+    suspend fun genreValues(): List<String>
+
+    @Query("SELECT * FROM movies WHERE id IN (:ids)")
+    suspend fun byIds(ids: List<Long>): List<Movie>
+
+    @Query("SELECT * FROM movies ORDER BY addedMillis DESC LIMIT :limit")
+    suspend fun recentlyAddedList(limit: Int): List<Movie>
+
     @Query("DELETE FROM movies WHERE sourceId = :sourceId")
     suspend fun deleteForSource(sourceId: Long)
 }
@@ -583,6 +885,61 @@ interface SeriesDao {
 
     @Upsert
     suspend fun upsertAll(items: List<Series>)
+
+    @Query(
+        """
+        SELECT id, seriesId, favourite FROM series
+        WHERE sourceId = :sourceId AND seriesId IN (:ids)
+        """
+    )
+    suspend fun userStateForSeriesIds(sourceId: Long, ids: List<String>): List<SeriesUserState>
+
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    suspend fun insertIgnore(items: List<Series>)
+
+    @Update
+    suspend fun updateAll(items: List<Series>)
+
+    @Query("DELETE FROM series WHERE sourceId = :sourceId AND lastSeenMillis < :syncStamp")
+    suspend fun deleteStale(sourceId: Long, syncStamp: Long)
+
+    @Query("SELECT COUNT(*) FROM series WHERE categoryId = :categoryId")
+    suspend fun countInCategory(categoryId: String): Int
+
+    @Query(
+        """
+        SELECT * FROM series
+        WHERE categoryId = :categoryId
+          AND (addedMillis < :afterAdded OR (addedMillis = :afterAdded AND id < :afterId))
+        ORDER BY addedMillis DESC, id DESC
+        LIMIT :limit
+        """
+    )
+    suspend fun pageInCategory(
+        categoryId: String,
+        afterAdded: Long,
+        afterId: Long,
+        limit: Int,
+    ): List<Series>
+
+    @Query(
+        """
+        SELECT * FROM series
+        WHERE genre LIKE '%' || :token || '%'
+        ORDER BY addedMillis DESC, id DESC
+        LIMIT :limit
+        """
+    )
+    suspend fun inGenre(token: String, limit: Int): List<Series>
+
+    @Query("SELECT genre FROM series WHERE genre IS NOT NULL AND genre != ''")
+    suspend fun genreValues(): List<String>
+
+    @Query("SELECT * FROM series WHERE id IN (:ids)")
+    suspend fun byIds(ids: List<Long>): List<Series>
+
+    @Query("SELECT * FROM series ORDER BY addedMillis DESC LIMIT :limit")
+    suspend fun recentlyAddedList(limit: Int): List<Series>
 
     @Query("DELETE FROM series WHERE sourceId = :sourceId")
     suspend fun deleteForSource(sourceId: Long)

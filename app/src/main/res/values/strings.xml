@@ -24,9 +24,9 @@
     <string name="common_try_again">Try again</string>
 
     <!-- ============================ Navigation rail ============================ -->
-    <string name="nav_live_tv">Live TV</string>
+    <string name="nav_live_tv">Channels</string>
     <string name="nav_movies">Movies</string>
-    <string name="nav_shows">Shows</string>
+    <string name="nav_shows">Series</string>
     <string name="nav_recordings">Recordings</string>
     <string name="nav_search">Search</string>
     <string name="nav_settings">Settings</string>
@@ -54,6 +54,23 @@
     <string name="guide_no_info">No guide information</string>
     <string name="guide_next_prefix">Next  %1$s  %2$s</string>
     <string name="guide_loading_channels">Loading your channels</string>
+    <string name="load_step_channels">%1$s / %2$s channels</string>
+    <string name="load_step_channels_so_far">%1$s channels</string>
+    <string name="load_step_movies">%1$s / %2$s movies</string>
+    <string name="load_step_movies_so_far">%1$s movies</string>
+    <string name="load_step_series">%1$s / %2$s series</string>
+    <string name="load_step_series_so_far">%1$s series</string>
+    <string name="load_step_guide">%1$s / %2$s programmes</string>
+    <string name="load_step_guide_so_far">%1$s programmes</string>
+    <string name="load_step_match">Guide %1$s / %2$s</string>
+    <string name="load_step_match_so_far">Guide %1$s</string>
+    <string name="load_failed_too_large">This list is too large to finish. What was already saved is kept. Try again.</string>
+    <string name="load_failed_partial">The download stopped before the end. What was already saved is kept.</string>
+    <string name="guide_wide_title">%1$s channels</string>
+    <string name="guide_wide_desc">Choose a category or search.</string>
+    <string name="guide_empty_category">No channels in this category.</string>
+    <string name="vod_wide_title">%1$s titles</string>
+    <string name="vod_wide_desc">Choose a category.</string>
     <string name="guide_fetching_desc">Fetching the channel list and guide from your provider. A large provider can take a couple of minutes the first time.</string>
     <string name="guide_building_desc">Building your guide from the channels saved on this device. On a big provider this takes a moment — it\'ll appear shortly.</string>
     <string name="guide_no_favourites_title">No favourites yet</string>
@@ -152,7 +169,7 @@
     <string name="settings_webmanager_title">Manage on phone or laptop</string>
     <string name="settings_webmanager_subtitle">Organise channels in a browser, with a keyboard and mouse</string>
     <string name="settings_display_title">Display &amp; playback</string>
-    <string name="settings_display_subtitle">Theme, subtitles, live guide preview</string>
+    <string name="settings_display_subtitle">Theme, LITE mode, subtitles, live guide preview</string>
     <string name="settings_recording_title">Recording</string>
     <string name="settings_recording_subtitle">Where recordings are saved — this box or a NAS</string>
     <string name="settings_parental_title">Parental controls</string>
@@ -181,6 +198,11 @@
     <string name="settings_language_spanish">Español</string>
     <string name="settings_language_note">Sets the app\'s language. The screen reloads when you change it.</string>
     <string name="settings_section_guide">Guide</string>
+    <string name="settings_section_performance">Performance</string>
+    <string name="settings_lite_title">LITE mode</string>
+    <string name="settings_lite_subtitle">Uses only the free memory on this device. Turns off the guide\'s second video decoder and keeps a shorter playback buffer. Picture quality stays the same.</string>
+    <string name="settings_lite_memory">Free RAM %1$d MB · image cache %2$d MB</string>
+    <string name="settings_live_preview_lite">Off while LITE mode is on, so the guide doesn\'t open a second video decoder. Turn LITE off to use the preview again.</string>
     <string name="settings_channel_layout_title">Channel layout</string>
     <string name="settings_channel_layout_grid">Guide grid (with timeline)</string>
     <string name="settings_channel_layout_list">Simple list</string>
@@ -201,7 +223,7 @@
 
     <!-- ============================ Parental controls ============================ -->
     <string name="parental_hidden_categories">Hidden categories</string>
-    <string name="parental_hidden_desc">Anything switched on here is removed from Live TV until you turn on “Show hidden now” below. With a PIN set, this screen stays locked, so hidden stays hidden.</string>
+    <string name="parental_hidden_desc">Anything switched on here is removed from Channels until you turn on “Show hidden now” below. With a PIN set, this screen stays locked, so hidden stays hidden.</string>
     <string name="parental_show_hidden_title">Show hidden now (this session)</string>
     <string name="parental_show_hidden_subtitle">Reveals hidden categories until the app is restarted.</string>
     <string name="parental_no_categories">No categories yet — add a provider first.</string>
@@ -277,6 +299,7 @@
     <string name="recset_autoswitch_desc">On a single-connection provider, move the screen onto a recording as it starts (with a 30-second warning) so your live stream isn\'t cut off</string>
     <string name="recset_livepause">Pause &amp; rewind live TV</string>
     <string name="recset_livepause_desc">Hold a couple of minutes of live TV in memory so you can pause and rewind it (experimental — uses more memory)</string>
+    <string name="recset_livepause_lite">Saved, but not used while LITE mode is on.</string>
     <string name="recset_pw_show">Show password</string>
     <string name="recset_pw_hide">Hide password</string>
     <string name="recset_storage_title">Storage</string>
@@ -412,7 +435,7 @@
 
     <!-- ============================ Search ============================ -->
     <string name="search_type_name">Type a name</string>
-    <string name="search_start_hint">Start typing to search channels, movies and shows.</string>
+    <string name="search_start_hint">Start typing to search channels, movies and series.</string>
     <string name="search_no_results">No results for “%1$s”.</string>
 
     <!-- ============================ On-screen keyboard ============================ -->
@@ -422,18 +445,18 @@
     <string name="kbd_paste">Paste</string>
     <string name="kbd_clipboard_empty">Nothing to paste</string>
 
-    <!-- ============================ Movies & shows (VOD) ============================ -->
+    <!-- ============================ Movies and series (VOD) ============================ -->
     <string name="vod_loading_movies">Loading movies</string>
     <string name="vod_no_movies">No movies</string>
     <string name="vod_no_movies_provider">This provider didn\'t return any movies.</string>
     <string name="vod_no_movies_add">Add a provider to see its movies here.</string>
-    <string name="vod_loading_shows">Loading shows</string>
-    <string name="vod_no_shows">No shows</string>
-    <string name="vod_no_shows_provider">This provider didn\'t return any shows.</string>
-    <string name="vod_no_shows_add">Add a provider to see its shows here.</string>
+    <string name="vod_loading_shows">Loading series</string>
+    <string name="vod_no_shows">No series</string>
+    <string name="vod_no_shows_provider">This provider didn\'t return any series.</string>
+    <string name="vod_no_shows_add">Add a provider to see its series here.</string>
     <string name="vod_loading_episodes">Loading episodes…</string>
     <string name="vod_all">All</string>
-    <string name="vod_search_hint">Search movies &amp; shows</string>
+    <string name="vod_search_hint">Search movies and series</string>
     <string name="vod_continue_watching">Continue watching</string>
     <string name="vod_large_provider_note">A large provider can take a couple of minutes the first time.</string>
     <string name="vod_recommended">Recommended for you</string>
@@ -498,7 +521,7 @@
 
     <!-- Metadata / TMDB back-fill -->
     <string name="settings_section_metadata">Metadata</string>
-    <string name="settings_tmdb_note">Paste your own free TMDB API key to fill in missing posters, backdrops, cast and synopses on Movies &amp; Shows. It stays on this device.</string>
+    <string name="settings_tmdb_note">Paste your own free TMDB API key to fill in missing posters, backdrops, cast and synopses on Movies and Series. It stays on this device.</string>
     <string name="settings_tmdb_key_label">TMDB API key</string>
     <string name="settings_tmdb_save">Save key</string>
     <string name="settings_tmdb_saved">TMDB key saved</string>

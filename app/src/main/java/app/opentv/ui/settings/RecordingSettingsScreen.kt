@@ -43,6 +43,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -109,6 +110,7 @@ fun RecordingSettingsScreen(onBack: () -> Unit) {
     var padEnd by remember { mutableStateOf(settings.recordPadEndMinutes.value) }
     var autoSwitch by remember { mutableStateOf(settings.recordAutoSwitch.value) }
     var livePause by remember { mutableStateOf(settings.livePauseEnabled.value) }
+    val liteMode by settings.liteMode.collectAsState()
 
     // The SAF folder picker. On a granted tree we take a persistable read/write permission so the
     // grant (and thus playback of what we record there) survives restarts, then remember the folder.
@@ -188,6 +190,13 @@ fun RecordingSettingsScreen(onBack: () -> Unit) {
                 subtitle = stringResource(R.string.recset_livepause_desc),
                 checked = livePause,
             ) { livePause = it; settings.setLivePauseEnabled(it) }
+            if (liteMode) {
+                Text(
+                    stringResource(R.string.recset_livepause_lite),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
         }
 
         Spacer(Modifier.height(20.dp))

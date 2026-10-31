@@ -91,8 +91,20 @@ class MainActivity : ComponentActivity() {
         super.attachBaseContext(app.opentv.core.LocaleUtils.wrap(newBase))
     }
 
+    override fun onStart() {
+        super.onStart()
+        app.opentv.core.MemoryGovernor.get(this).startForegroundWatch()
+    }
+
+    override fun onStop() {
+        app.opentv.core.LoadTrace.mark("MainActivity onStop finishing=$isFinishing")
+        app.opentv.core.MemoryGovernor.get(this).stopForegroundWatch()
+        super.onStop()
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        app.opentv.core.LoadTrace.mark("MainActivity onCreate")
         enableEdgeToEdge()
         handlePlayIntent(intent)
         val isTelevision = isRunningOnTelevision(this)

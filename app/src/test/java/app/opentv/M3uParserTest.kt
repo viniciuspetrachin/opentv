@@ -72,8 +72,7 @@ class M3uParserTest {
 
     @Test
     fun `duplicate tvg-ids do not collide`() {
-        // Providers routinely list SD and HD variants under one tvg-id. The unique index on
-        // (sourceId, streamId) would otherwise abort the entire import.
+        // Affiliates often share one tvg-id. The row identity is the url (or xui-id), so both stay.
         val playlist = """
             #EXTM3U
             #EXTINF:-1 tvg-id="dup",Channel SD
@@ -84,8 +83,10 @@ class M3uParserTest {
 
         val result = M3uParser.parse(playlist, sourceId = 1)
 
-        assertThat(result.channels).hasSize(1)
-        assertThat(result.channels.single().name).isEqualTo("Channel SD")
+        assertThat(result.channels).hasSize(2)
+        assertThat(result.channels.map { it.epgChannelId }).containsExactly("dup", "dup")
+        assertThat(result.channels.map { it.streamId }).containsNoDuplicates()
+        assertThat(result.channels.all { it.streamId.startsWith("url:") }).isTrue()
     }
 
     @Test
@@ -138,5 +139,64 @@ class M3uParserTest {
 
         assertThat(result.channels).isEmpty()
         assertThat(result.skippedEntries).isEqualTo(0)
+    }
+
+    @Test
+    fun `a banner row is hidden and a repeated tvg-id keeps the first`() {
+        val playlist = """
+            #EXTM3U url-tvg="http://example.com/guide.xml"
+            #EXTINF:-1 group-title="UK",#### UK GENERAL ####
+            http://example.com/banner.m3u8
+            #EXTINF:-1 tvg-id="dup" group-title="UK",First
+            http://example.com/first.m3u8
+            #EXTINF:-1 tvg-id="dup" group-title="UK",Second
+            http://example.com/second.m3u8
+            http://example.com/orphan.m3u8
+        """.trimIndent()
+
+        val result = M3uParser.parse(playlist, sourceId = 3)
+
+        assertThat(result.declaredEpgUrl).isEqualTo("http://example.com/guide.xml")
+        assertThat(result.skippedEntries).isEqualTo(1)
+        assertThat(result.channels).hasSize(3)
+        assertThat(result.channels[0].hidden).isTrue()
+        assertThat(result.channels[1].name).isEqualTo("First")
+        assertThat(result.channels[2].name).isEqualTo("Second")
+        assertThat(result.channels[1].epgChannelId).isEqualTo("dup")
+        assertThat(result.channels[2].epgChannelId).isEqualTo("dup")
+    }
+
+    @Test
+    fun `the same tvg-id with different xui-ids keeps both rows`() {
+        val playlist = """
+            #EXTM3U
+            #EXTINF:-1 tvg-id="REDEGL" xui-id="1",SP - Globo
+            http://example.com/sp.m3u8
+            #EXTINF:-1 tvg-id="REDEGL" xui-id="2",RJ - Globo
+            http://example.com/rj.m3u8
+        """.trimIndent()
+
+        val channels = M3uParser.parse(playlist, sourceId = 1).channels
+
+        assertThat(channels).hasSize(2)
+        assertThat(channels.map { it.streamId }).containsExactly("xui:1", "xui:2").inOrder()
+        assertThat(channels.map { it.epgChannelId }).containsExactly("REDEGL", "REDEGL")
+    }
+
+    @Test
+    fun `a repeated xui-id keeps the first row`() {
+        val playlist = """
+            #EXTM3U
+            #EXTINF:-1 xui-id="9",First
+            http://example.com/first.m3u8
+            #EXTINF:-1 xui-id="9",Second
+            http://example.com/second.m3u8
+        """.trimIndent()
+
+        val channels = M3uParser.parse(playlist, sourceId = 1).channels
+
+        assertThat(channels).hasSize(1)
+        assertThat(channels.single().name).isEqualTo("First")
+        assertThat(channels.single().streamId).isEqualTo("xui:9")
     }
 }

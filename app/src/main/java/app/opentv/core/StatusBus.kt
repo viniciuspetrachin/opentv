@@ -27,6 +27,18 @@ object StatusBus {
     /** 0..1 progress for [message], or null for indeterminate (show a spinner, not a bar). */
     val progress: StateFlow<Float?> = _progress.asStateFlow()
 
+    private val _snapshot = MutableStateFlow<LoadSnapshot?>(null)
+
+    /**
+     * Structured load line (step, counts, overall fraction). The shell prefers this over
+     * [message] while a catalogue download is running.
+     */
+    val snapshot: StateFlow<LoadSnapshot?> = _snapshot.asStateFlow()
+
+    fun publish(snapshot: LoadSnapshot?) {
+        _snapshot.value = snapshot
+    }
+
     fun set(message: String?, progress: Float? = null) {
         _message.value = message
         _progress.value = if (message == null) null else progress

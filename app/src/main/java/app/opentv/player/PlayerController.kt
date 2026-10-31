@@ -67,6 +67,12 @@ class PlayerController(
      */
     private val dvr: Boolean = false,
     /**
+     * Short buffer with a hard byte cap. Same resolution and the same ~2.5 s start as the normal
+     * player; a high-bitrate stream just isn't allowed to park a minute of video in RAM. Preview,
+     * DVR and watch-while-recording keep their own tuning.
+     */
+    private val lite: Boolean = false,
+    /**
      * When set, `smb://` media (a recording on a NAS) is read through this source so it plays and
      * seeks in-app. Null for the live/VOD players, which never see an smb URI.
      */
@@ -195,6 +201,7 @@ class PlayerController(
                         preview -> PREVIEW_MAX_BUFFER_MILLIS
                         dvr -> DVR_MAX_BUFFER_MILLIS
                         liveRecording -> LIVE_REC_MAX_BUFFER_MILLIS
+                        lite -> LITE_MAX_BUFFER_MILLIS
                         else -> MAX_BUFFER_MILLIS
                     },
                     when {
@@ -208,8 +215,17 @@ class PlayerController(
                         else -> BUFFER_FOR_PLAYBACK_AFTER_REBUFFER_MILLIS
                     },
                 )
-                // Retain the last few minutes so pause/rewind of live TV has something to seek into.
-                .apply { if (dvr) setBackBuffer(DVR_BACK_BUFFER_MILLIS, true) }
+                .apply {
+                    // Retain the last few minutes so pause/rewind of live TV has something to seek into.
+                    if (dvr) setBackBuffer(DVR_BACK_BUFFER_MILLIS, true)
+                    // LITE only, and not for the special players above: cap native buffer RAM.
+                    // prioritizeTimeOverSize false means the byte cap wins over the time target,
+                    // so a high-bitrate channel cannot grow past ~16 MB.
+                    if (lite && !preview && !dvr && !liveRecording) {
+                        setTargetBufferBytes(LITE_TARGET_BUFFER_BYTES)
+                        setPrioritizeTimeOverSizeThresholds(false)
+                    }
+                }
                 .build(),
         )
         .build()
@@ -394,6 +410,10 @@ class PlayerController(
         const val MAX_BUFFER_MILLIS = 60_000
         const val BUFFER_FOR_PLAYBACK_MILLIS = 2_500
         const val BUFFER_FOR_PLAYBACK_AFTER_REBUFFER_MILLIS = 5_000
+
+        /** LITE: a short time window plus a hard byte cap. Start threshold stays at 2.5 s. */
+        const val LITE_MAX_BUFFER_MILLIS = 20_000
+        const val LITE_TARGET_BUFFER_BYTES = 16 * 1024 * 1024
 
         // DVR mode (pause & rewind live TV): keep a couple of minutes behind the live edge to seek
         // into, and let the forward buffer grow to match so a pause of up to a couple of minutes

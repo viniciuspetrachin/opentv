@@ -184,6 +184,7 @@ fun MainScreen(
                 )
                 Tab.MOVIES -> MoviesScreen(
                     onOpenMovie = onOpenMovie,
+                    onPlayChannel = onPlayChannel,
                     onResume = onResume,
                     onOpenSearch = onOpenSearch,
                     hasSources = hasSources,
@@ -191,6 +192,7 @@ fun MainScreen(
                 )
                 Tab.SHOWS -> SeriesScreen(
                     onOpenSeries = onOpenSeries,
+                    onPlayChannel = onPlayChannel,
                     onResume = onResume,
                     onOpenSearch = onOpenSearch,
                     hasSources = hasSources,
@@ -211,8 +213,50 @@ fun MainScreen(
  */
 @Composable
 private fun StatusBar() {
+    val snapshot by StatusBus.snapshot.collectAsState()
     val message by StatusBus.message.collectAsState()
     val progress by StatusBus.progress.collectAsState()
+    val snap = snapshot
+    if (snap != null) {
+        val percent = loadPercent(snap)
+        Column(
+            Modifier
+                .fillMaxWidth()
+                .background(MaterialTheme.colorScheme.surfaceVariant)
+                .padding(horizontal = 16.dp, vertical = 6.dp),
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                if (percent == null) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(14.dp),
+                        strokeWidth = 2.dp,
+                        color = MaterialTheme.colorScheme.primary,
+                    )
+                } else {
+                    Text(
+                        percent,
+                        style = MaterialTheme.typography.labelLarge,
+                        color = MaterialTheme.colorScheme.primary,
+                    )
+                }
+                Spacer(Modifier.width(12.dp))
+                Text(
+                    loadStepLabel(snap),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            if (percent != null && snap.fraction != null) {
+                Spacer(Modifier.height(4.dp))
+                LinearProgressIndicator(
+                    progress = { snap.fraction },
+                    modifier = Modifier.fillMaxWidth().height(3.dp),
+                    color = MaterialTheme.colorScheme.primary,
+                )
+            }
+        }
+        return
+    }
     val text = message ?: return
     val p = progress
     Column(

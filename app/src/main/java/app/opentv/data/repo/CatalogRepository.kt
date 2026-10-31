@@ -7,6 +7,11 @@ package app.opentv.data.repo
 
 import android.util.Log
 import app.opentv.core.AppSettings
+import app.opentv.core.CountingInputStream
+import app.opentv.core.LoadMeter
+import app.opentv.core.LoadStep
+import app.opentv.core.LoadTrace
+import app.opentv.core.LongOpenSet
 import app.opentv.data.db.CategoryDao
 import app.opentv.data.db.ChannelDao
 import app.opentv.data.db.EpisodeDao
@@ -23,15 +28,25 @@ import app.opentv.data.model.Series
 import app.opentv.data.model.Source
 import app.opentv.data.model.SourceKind
 import app.opentv.data.model.StreamKind
+import java.util.concurrent.TimeUnit
 import app.opentv.data.parser.ChannelNameNormalizer
+import app.opentv.data.parser.M3uGroups
 import app.opentv.data.parser.M3uParser
 import app.opentv.data.parser.VodTitleCleaner
+import app.opentv.data.parser.fnv64
+import app.opentv.data.parser.isSeparatorRow
 import app.opentv.data.remote.StalkerApi
 import app.opentv.data.remote.TmdbClient
 import app.opentv.data.remote.XtreamApi
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.job
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -114,8 +129,9 @@ internal fun collapseMovieVariants(movies: List<Movie>): List<MovieVariantGroup>
  * Channels, movies and series.
  *
  * Same principle as [EpgRepository]: a refresh that fails must never leave the user with less
- * than they started with. Catalogue writes go through [ChannelDao.replaceCatalogue], which
- * merges rather than wipes and carries favourites, hidden flags and manual ordering across.
+ * than they started with. A large playlist is written in batches of a few hundred rows.
+ * [ChannelDao.deleteStale] runs only after the last batch succeeds, so a sync that dies halfway
+ * keeps both the old rows and whatever was already saved.
  */
 class CatalogRepository(
     private val sourceDao: SourceDao,
@@ -134,6 +150,16 @@ class CatalogRepository(
     /** TMDB back-fill for VOD detail pages, gated on a user-supplied key. See [TmdbClient]. */
     private val tmdb = TmdbClient(http, settings)
 
+    /**
+     * The shared client caps a call at five minutes. A large playlist spends that time writing
+     * batches between reads, so the cap closes the socket with the catalogue half saved.
+     * This client has no overall cap. A socket that stops sending still fails on the read timeout.
+     */
+    private val downloadHttp = http.newBuilder()
+        .callTimeout(0, TimeUnit.MILLISECONDS)
+        .readTimeout(3, TimeUnit.MINUTES)
+        .build()
+
     sealed interface SyncResult {
         data class Success(
             val channelCount: Int,
@@ -141,7 +167,13 @@ class CatalogRepository(
             val seriesCount: Int,
         ) : SyncResult
 
-        data class Failed(val reason: String, val cause: Throwable?) : SyncResult
+        data class Failed(
+            val reason: String,
+            val cause: Throwable?,
+            val tooLarge: Boolean = false,
+            /** The body ended early. Channels and categories already written stay. */
+            val partial: Boolean = false,
+        ) : SyncResult
     }
 
     fun observeChannels(sourceId: Long? = null, categoryId: String? = null): Flow<List<Channel>> =
@@ -149,6 +181,33 @@ class CatalogRepository(
 
     fun observeChannelsIn(categoryIds: List<String>): Flow<List<Channel>> =
         channelDao.observeInCategories(categoryIds)
+
+    suspend fun countVisible(sourceId: Long?): Int = channelDao.countVisible(sourceId)
+
+    suspend fun countInCategories(sourceId: Long?, categoryIds: List<String>): Int =
+        if (categoryIds.isEmpty()) 0 else channelDao.countInCategories(sourceId, categoryIds)
+
+    /** One page of a large category. See [ChannelDao.pageInCategories]. */
+    suspend fun pageChannels(
+        sourceId: Long?,
+        categoryIds: List<String>,
+        afterSort: Int,
+        afterId: Long,
+        limit: Int,
+    ): List<Channel> = channelDao.pageInCategories(sourceId, categoryIds, afterSort, afterId, limit)
+
+    suspend fun countInCategoriesIncludingHidden(sourceId: Long?, categoryIds: List<String>): Int =
+        if (categoryIds.isEmpty()) 0
+        else channelDao.countInCategoriesIncludingHidden(sourceId, categoryIds)
+
+    suspend fun pageChannelsIncludingHidden(
+        sourceId: Long?,
+        categoryIds: List<String>,
+        afterSort: Int,
+        afterId: Long,
+        limit: Int,
+    ): List<Channel> =
+        channelDao.pageInCategoriesIncludingHidden(sourceId, categoryIds, afterSort, afterId, limit)
 
     /**
      * Channels in a set of categories INCLUDING hidden ones, optionally scoped to one source — the
@@ -165,6 +224,26 @@ class CatalogRepository(
     fun observeChannelCount(): Flow<Int> = channelDao.observeVisibleCount()
 
     fun observeCategories(kind: StreamKind): Flow<List<Category>> = categoryDao.observe(kind)
+
+    fun observeCategoriesWithChannels(): Flow<List<Category>> = categoryDao.observeWithChannels()
+
+    suspend fun countMoviesIn(categoryId: String): Int = movieDao.countInCategory(categoryId)
+
+    suspend fun pageMovies(
+        categoryId: String,
+        afterAdded: Long,
+        afterId: Long,
+        limit: Int,
+    ): List<Movie> = movieDao.pageInCategory(categoryId, afterAdded, afterId, limit)
+
+    suspend fun countSeriesIn(categoryId: String): Int = seriesDao.countInCategory(categoryId)
+
+    suspend fun pageSeries(
+        categoryId: String,
+        afterAdded: Long,
+        afterId: Long,
+        limit: Int,
+    ): List<Series> = seriesDao.pageInCategory(categoryId, afterAdded, afterId, limit)
 
     fun observeMovies(categoryId: String? = null): Flow<List<Movie>> = movieDao.observe(categoryId)
 
@@ -555,6 +634,68 @@ class CatalogRepository(
         return if (parts.size == 2 && parts[0] == "movie") parts[1].toLongOrNull() else null
     }
 
+    /**
+     * Recommended row from the profile's most-watched genre, capped. No watch history with a
+     * genre leaves the row empty — it does not fall back to a scan of the table.
+     */
+    suspend fun recommendedMoviesLimited(profileId: Long, limit: Int = 30): List<Movie> =
+        withContext(Dispatchers.IO) {
+            val ids = watchedMovieIds(profileId)
+            if (ids.isEmpty()) return@withContext emptyList()
+            val watched = movieDao.byIds(ids.toList())
+            val top = topGenreTokens(watched.map { it.genre }, 1).firstOrNull() ?: return@withContext emptyList()
+            movieDao.inGenre(top, limit).filter { it.id !in ids }.take(limit)
+        }
+
+    /**
+     * Genre shelves as bounded queries. At or under [libraryCap] the tokens come from the genre
+     * column only. Above it they come from the profile's watched titles and the newest rows.
+     */
+    suspend fun movieGenreShelves(
+        profileId: Long,
+        libraryCap: Int,
+        maxGenres: Int = 12,
+        perGenre: Int = 30,
+    ): List<GenreGroup<Movie>> = withContext(Dispatchers.IO) {
+        val count = movieDao.count()
+        if (count == 0) return@withContext emptyList()
+        val tokens = if (count <= libraryCap) {
+            topGenreTokens(movieDao.genreValues(), maxGenres)
+        } else {
+            val ids = watchedMovieIds(profileId)
+            val watched = if (ids.isEmpty()) emptyList() else movieDao.byIds(ids.toList())
+            val recent = movieDao.recentlyAddedList(perGenre)
+            topGenreTokens(watched.map { it.genre } + recent.map { it.genre }, maxGenres)
+        }
+        tokens.map { GenreGroup(it, movieDao.inGenre(it, perGenre)) }
+    }
+
+    /** Series sibling of [movieGenreShelves]. Episodes are not a genre history, so a large
+     *  library takes its tokens from the newest rows only. */
+    suspend fun seriesGenreShelves(
+        libraryCap: Int,
+        maxGenres: Int = 12,
+        perGenre: Int = 30,
+    ): List<GenreGroup<Series>> = withContext(Dispatchers.IO) {
+        val count = seriesDao.count()
+        if (count == 0) return@withContext emptyList()
+        val tokens = if (count <= libraryCap) {
+            topGenreTokens(seriesDao.genreValues(), maxGenres)
+        } else {
+            topGenreTokens(seriesDao.recentlyAddedList(perGenre).map { it.genre }, maxGenres)
+        }
+        tokens.map { GenreGroup(it, seriesDao.inGenre(it, perGenre)) }
+    }
+
+    private fun topGenreTokens(raws: List<String?>, limit: Int): List<String> {
+        if (limit <= 0) return emptyList()
+        val counts = HashMap<String, Int>()
+        for (raw in raws) {
+            for (token in splitGenres(raw)) counts[token] = (counts[token] ?: 0) + 1
+        }
+        return counts.entries.sortedByDescending { it.value }.take(limit).map { it.key }
+    }
+
     suspend fun setChannelFavourite(id: Long, favourite: Boolean) =
         channelDao.setFavourite(id, favourite)
 
@@ -609,66 +750,130 @@ class CatalogRepository(
 
     /**
      * Full catalogue: live channels, then movies and series. Used by the periodic worker and by a
-     * manual refresh, where there's no user staring at a spinner. The initial add takes the faster
-     * [syncLive] + background [syncVod] path instead, so the guide appears without waiting for a
-     * 40,000-title VOD list.
+     * manual refresh. [meter] carries the shared percent across every step when the UI is watching.
      */
-    suspend fun sync(source: Source, nowUtcMillis: Long): SyncResult = withContext(Dispatchers.IO) {
-        // Skip fetching a content type the user has switched off — that's the whole speed-up.
-        // Live is gated here (not in syncLive) so onboarding's direct syncLive still loads channels.
-        // Already-synced rows are left untouched: turning a type back on and refreshing restores it.
-        val live =
-            if (settings.liveEnabled.value) syncLive(source, nowUtcMillis)
-            else SyncResult.Success(0, 0, 0)
-        if (live is SyncResult.Success && source.kind == SourceKind.XTREAM) {
-            runCatching { syncXtreamVod(source, nowUtcMillis) }
-                .onFailure { Log.w(TAG, "VOD sync failed for source ${source.id}", it) }
+    suspend fun sync(source: Source, nowUtcMillis: Long, meter: LoadMeter? = null): SyncResult =
+        withContext(Dispatchers.IO) {
+            val live =
+                if (settings.liveEnabled.value) syncLive(source, nowUtcMillis, meter)
+                else SyncResult.Success(0, 0, 0)
+            if (live is SyncResult.Success && source.kind == SourceKind.XTREAM) {
+                runCatching { syncXtreamVod(source, nowUtcMillis, meter) }
+                    .onFailure { error ->
+                        if (error is CancellationException) throw error
+                        LoadTrace.mark("vod sync failed id=${source.id}", error)
+                        Log.w(TAG, "VOD sync failed for source ${source.id}", error)
+                    }
+            }
+            live
         }
-        live
+
+    /**
+     * Weighs the downloads this source will actually make, so the percent has a denominator
+     * before the first byte arrives. A missing length falls back to the size remembered from
+     * the previous sync. It does not invent one.
+     */
+    suspend fun planLoad(
+        source: Source,
+        meter: LoadMeter,
+        includeLive: Boolean,
+        includeVod: Boolean,
+    ) {
+        coroutineScope {
+            val jobs = ArrayList<kotlinx.coroutines.Deferred<Unit>>()
+            if (includeLive) {
+                jobs += async { meter.plan(LoadStep.CHANNELS, probeStep(source, LoadStep.CHANNELS)) }
+            }
+            if (includeVod && source.kind == SourceKind.XTREAM && settings.moviesEnabled.value) {
+                jobs += async { meter.plan(LoadStep.MOVIES, probeStep(source, LoadStep.MOVIES)) }
+            }
+            if (includeVod && source.kind == SourceKind.XTREAM && settings.seriesEnabled.value) {
+                jobs += async { meter.plan(LoadStep.SERIES, probeStep(source, LoadStep.SERIES)) }
+            }
+            jobs.awaitAll()
+        }
     }
 
     /** Live channels only — the fast path so the guide can show before VOD and the guide load. */
-    suspend fun syncLive(source: Source, nowUtcMillis: Long): SyncResult = withContext(Dispatchers.IO) {
+    suspend fun syncLive(
+        source: Source,
+        nowUtcMillis: Long,
+        meter: LoadMeter? = null,
+    ): SyncResult = withContext(Dispatchers.IO) {
+        LoadTrace.mark("syncLive start id=${source.id} kind=${source.kind}")
         try {
-            when (source.kind) {
-                SourceKind.XTREAM -> syncXtreamLive(source, nowUtcMillis)
-                SourceKind.M3U -> syncM3u(source, nowUtcMillis)
+            val result = when (source.kind) {
+                SourceKind.XTREAM -> syncXtreamLive(source, nowUtcMillis, meter)
+                SourceKind.M3U -> syncM3u(source, nowUtcMillis, meter)
                 SourceKind.STALKER -> syncStalkerLive(source, nowUtcMillis)
             }
+            val detail = when (result) {
+                is SyncResult.Success -> "ok channels=${result.channelCount}"
+                is SyncResult.Failed -> "failed ${result.reason}"
+            }
+            LoadTrace.mark("syncLive end id=${source.id} $detail")
+            result
         } catch (e: CancellationException) {
             throw e
-        } catch (e: Exception) {
-            Log.w(TAG, "Catalogue sync failed for source ${source.id}", e)
-            SyncResult.Failed(e.message ?: "The catalogue could not be downloaded.", e)
+        } catch (t: Throwable) {
+            LoadTrace.mark("syncLive failed id=${source.id} kind=${source.kind}", t)
+            Log.w(TAG, "Catalogue sync failed for source ${source.id}", t)
+            val oom = t is OutOfMemoryError
+            val partial = t is java.io.InterruptedIOException
+            SyncResult.Failed(
+                when {
+                    oom -> TOO_LARGE
+                    partial -> PARTIAL
+                    else -> t.message ?: "The catalogue could not be downloaded."
+                },
+                t,
+                tooLarge = oom,
+                partial = partial,
+            )
         }
     }
 
-    /** Movies + series — best-effort, meant to run in the background so a huge VOD list never
-     * blocks live TV. Silent on failure: an account with no VOD is normal, not an error. */
-    suspend fun syncVod(source: Source, nowUtcMillis: Long) = withContext(Dispatchers.IO) {
-        runCatching { if (source.kind == SourceKind.XTREAM) syncXtreamVod(source, nowUtcMillis) }
-            .onFailure { Log.w(TAG, "VOD sync failed for source ${source.id}", it) }
-    }
+    /**
+     * Movies + series. Returns false when a step failed so the freshness stamp is not set and
+     * the next open tries again. An account with no VOD is a success, not a failure.
+     */
+    suspend fun syncVod(source: Source, nowUtcMillis: Long, meter: LoadMeter? = null): Boolean =
+        withContext(Dispatchers.IO) {
+            if (source.kind != SourceKind.XTREAM) return@withContext true
+            try {
+                syncXtreamVod(source, nowUtcMillis, meter)
+                true
+            } catch (e: CancellationException) {
+                throw e
+            } catch (t: Throwable) {
+                LoadTrace.mark("vod sync failed id=${source.id}", t)
+                Log.w(TAG, "VOD sync failed for source ${source.id}", t)
+                false
+            }
+        }
 
-    private suspend fun syncXtreamLive(source: Source, nowUtcMillis: Long): SyncResult {
+    private suspend fun syncXtreamLive(
+        source: Source,
+        nowUtcMillis: Long,
+        meter: LoadMeter?,
+    ): SyncResult {
         // Authenticate first so a wrong password produces a clear message rather than
         // four separate confusing failures further down.
         api.authenticate(source)
 
         val liveCategories = api.liveCategories(source)
-        val channels = api.liveStreams(source)
-        if (channels.isEmpty()) {
+        if (liveCategories.isNotEmpty()) categoryDao.upsertAll(liveCategories)
+        val categoryNames = liveCategories.associate { it.id to it.name }
+        val accepted = writeXtreamChannels(source, categoryNames, nowUtcMillis, meter)
+        if (accepted == 0) {
             return SyncResult.Failed(
                 "The server returned no channels. The account may have no package assigned.",
                 null,
             )
         }
-
-        categoryDao.upsertAll(liveCategories)
-        val categoryNames = liveCategories.associate { it.id to it.name }
-        channelDao.replaceCatalogue(source.id, normalized(channels, categoryNames), nowUtcMillis)
+        channelDao.deleteStale(source.id, nowUtcMillis)
         sourceDao.markCatalogSynced(source.id, nowUtcMillis)
-        return SyncResult.Success(channels.size, 0, 0)
+        return SyncResult.Success(accepted, 0, 0)
     }
 
     /**
@@ -705,82 +910,198 @@ class CatalogRepository(
         return runCatching { stalkerApi.createLink(source, cmd) }.getOrNull() ?: channel.streamUrl
     }
 
-    private suspend fun syncXtreamVod(source: Source, nowUtcMillis: Long) {
-        // VOD is optional: plenty of accounts have live TV only, and a 404 on get_vod_streams
-        // must not cost the user their channel list. Movies and series are gated independently so
-        // a user who only turned off, say, Series still gets their movie library refreshed.
+    private suspend fun syncXtreamVod(source: Source, nowUtcMillis: Long, meter: LoadMeter?) {
         val moviesOn = settings.moviesEnabled.value
         val seriesOn = settings.seriesEnabled.value
         if (!moviesOn && !seriesOn) return
 
-        val movieCategories =
-            if (moviesOn) runCatching { api.movieCategories(source) }.getOrDefault(emptyList())
-            else emptyList()
-        val movies =
-            if (moviesOn) runCatching { api.movies(source) }.getOrDefault(emptyList())
-            else emptyList()
-        val seriesCategories =
-            if (seriesOn) runCatching { api.seriesCategories(source) }.getOrDefault(emptyList())
-            else emptyList()
-        val series =
-            if (seriesOn) runCatching { api.series(source) }.getOrDefault(emptyList())
-            else emptyList()
-
-        if (movieCategories.isNotEmpty() || seriesCategories.isNotEmpty()) {
-            categoryDao.upsertAll(movieCategories + seriesCategories)
+        if (moviesOn) {
+            val movieCategories =
+                runCatching { api.movieCategories(source) }.getOrDefault(emptyList())
+            if (movieCategories.isNotEmpty()) categoryDao.upsertAll(movieCategories)
+            val names = movieCategories.associate { it.id to it.name }
+            writeMovies(source, nowUtcMillis, names, meter)
+            movieDao.deleteStale(source.id, nowUtcMillis)
         }
-        if (movies.isNotEmpty()) movieDao.upsertAll(movies)
-        if (series.isNotEmpty()) seriesDao.upsertAll(series)
+        if (seriesOn) {
+            val seriesCategories =
+                runCatching { api.seriesCategories(source) }.getOrDefault(emptyList())
+            if (seriesCategories.isNotEmpty()) categoryDao.upsertAll(seriesCategories)
+            val names = seriesCategories.associate { it.id to it.name }
+            writeSeries(source, nowUtcMillis, names, meter)
+            seriesDao.deleteStale(source.id, nowUtcMillis)
+        }
     }
 
-    private suspend fun syncM3u(source: Source, nowUtcMillis: Long): SyncResult {
+    private suspend fun syncM3u(
+        source: Source,
+        nowUtcMillis: Long,
+        meter: LoadMeter?,
+    ): SyncResult {
+        LoadTrace.mark("m3u download start id=${source.id}")
         val request = Request.Builder()
             .url(source.url)
             .header("User-Agent", source.userAgent)
             .build()
+        val call = downloadHttp.newCall(request)
+        currentCoroutineContext().job.invokeOnCompletion { cause ->
+            if (cause != null) call.cancel()
+        }
 
-        val parsed = http.newCall(request).execute().use { response ->
+        var accepted = 0
+        val batch = ArrayList<Channel>(CATALOGUE_BATCH)
+        val categoryNames = ArrayList<String>()
+        val seenCategories = HashSet<String>()
+        var categoriesWritten = 0
+        suspend fun flushCategories() {
+            if (categoriesWritten >= categoryNames.size) return
+            writeM3uCategories(source.id, categoryNames)
+            categoriesWritten = categoryNames.size
+        }
+        fun noteCategory(channel: Channel) {
+            val name = channel.categoryId?.takeIf { it.isNotBlank() } ?: return
+            if (seenCategories.add(name)) categoryNames += name
+        }
+        try {
+        val header = call.execute().use { response ->
+            val length = response.body?.contentLength() ?: -1L
+            LoadTrace.mark("m3u response id=${source.id} http=${response.code} bytes=$length")
             if (!response.isSuccessful) {
                 return SyncResult.Failed("Playlist download failed (HTTP ${response.code}).", null)
             }
             val stream = response.body?.byteStream()
                 ?: return SyncResult.Failed("The playlist was empty.", null)
-            M3uParser.parse(stream, source.id)
+            meter?.begin(LoadStep.CHANNELS, length)
+            val counting = CountingInputStream(stream) { read -> meter?.setBytes(read) }
+            LoadTrace.mark("m3u parse start id=${source.id}")
+            M3uParser.parse(counting.bufferedReader(), source.id) { channel ->
+                currentCoroutineContext().ensureActive()
+                noteCategory(channel)
+                batch += channel
+                accepted++
+                if (batch.size >= CATALOGUE_BATCH) {
+                    flushChannels(source.id, batch, nowUtcMillis)
+                    batch.clear()
+                    flushCategories()
+                    meter?.setItems(accepted)
+                    LoadTrace.mark("m3u batch n=$accepted")
+                }
+            }
         }
-
-        if (parsed.channels.isEmpty()) {
+        if (batch.isNotEmpty()) {
+            flushChannels(source.id, batch, nowUtcMillis)
+            meter?.setItems(accepted)
+            LoadTrace.mark("m3u batch n=$accepted")
+        }
+        flushCategories()
+        if (accepted == 0) {
             return SyncResult.Failed(
                 "No channels found in that playlist. Check the URL points at an M3U file.",
                 null,
             )
         }
 
-        // Synthesise categories from group-title so the UI has something to group by.
-        val categories = parsed.channels
-            .mapNotNull { it.categoryId }
-            .distinct()
-            .sorted()
-            .mapIndexed { index, name ->
-                Category(
+        writeM3uCategories(source.id, header.categories)
+        LoadTrace.mark(
+            "m3u parsed id=${source.id} channels=$accepted skipped=${header.skippedEntries} " +
+                "categories=${header.categories.size}",
+        )
+        remember(source.id, "channels", meter?.endStep(accepted) ?: -1L)
+
+        if (source.epgUrl.isNullOrBlank() && !header.declaredEpgUrl.isNullOrBlank()) {
+            sourceDao.update(source.copy(epgUrl = header.declaredEpgUrl))
+        }
+        channelDao.deleteStale(source.id, nowUtcMillis)
+        sourceDao.markCatalogSynced(source.id, nowUtcMillis)
+        return SyncResult.Success(accepted, 0, 0)
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (t: Throwable) {
+            // A timeout used to drop every group-title. The guide then had channels on disk,
+            // an empty rail, and nothing it would list.
+            runCatching { flushCategories() }
+            val oom = t is OutOfMemoryError
+            val partial = t is java.io.InterruptedIOException
+            return SyncResult.Failed(
+                when {
+                    oom -> TOO_LARGE
+                    partial -> PARTIAL
+                    else -> t.message ?: "The playlist download failed."
+                },
+                t,
+                tooLarge = oom,
+                partial = partial,
+            )
+        }
+    }
+
+    /**
+     * Builds or corrects category rows from group titles already stored on channels.
+     * Runs even when live categories already exist, so a database imported before movie and
+     * series groups were recognised still gets reclassified. Not a `SELECT *` of the channels.
+     */
+    suspend fun repairLiveCategories(sourceId: Long) {
+        val seeds = channelDao.liveCategorySeeds(sourceId)
+        if (seeds.isEmpty()) return
+        val existing = categoryDao.forSource(sourceId).groupBy { it.id }
+        var changed = 0
+        for (seed in seeds) {
+            val rows = existing[seed.categoryId].orEmpty()
+            val label = rows.firstOrNull()?.name ?: seed.categoryId
+            val kind = M3uGroups.kindOf(label)
+            if (kind == null) {
+                if (rows.isNotEmpty()) {
+                    categoryDao.deleteIds(sourceId, listOf(seed.categoryId))
+                    changed++
+                }
+                continue
+            }
+            val current = rows.singleOrNull()
+            if (current != null && current.kind == kind) continue
+            categoryDao.deleteIds(sourceId, listOf(seed.categoryId))
+            categoryDao.upsertAll(
+                listOf(
+                    Category(
+                        id = seed.categoryId,
+                        sourceId = sourceId,
+                        name = label,
+                        kind = kind,
+                        sortIndex = current?.sortIndex ?: seed.sortIndex,
+                    ),
+                ),
+            )
+            changed++
+        }
+        if (changed > 0) LoadTrace.mark("categories repaired source=$sourceId n=$changed")
+    }
+
+    /**
+     * Writes M3U group titles with the right kind. A decorated copy is removed, not stored.
+     * Replaces any previous row for the same id so a `LIVE` leftover does not sit beside the
+     * new kind — the primary key includes `kind`.
+     */
+    private suspend fun writeM3uCategories(sourceId: Long, names: List<String>) {
+        if (names.isEmpty()) return
+        val fresh = ArrayList<Category>(names.size)
+        val hide = ArrayList<String>()
+        for ((index, name) in names.withIndex()) {
+            val kind = M3uGroups.kindOf(name)
+            if (kind == null) hide += name
+            else {
+                fresh += Category(
                     id = name,
-                    sourceId = source.id,
+                    sourceId = sourceId,
                     name = name,
-                    kind = StreamKind.LIVE,
+                    kind = kind,
                     sortIndex = index,
                 )
             }
-
-        categoryDao.upsertAll(categories)
-        val categoryNames = categories.associate { it.id to it.name }
-        channelDao.replaceCatalogue(source.id, normalized(parsed.channels, categoryNames), nowUtcMillis)
-
-        // If the playlist declared its own guide URL and the user did not set one, adopt it.
-        if (source.epgUrl.isNullOrBlank() && !parsed.declaredEpgUrl.isNullOrBlank()) {
-            sourceDao.update(source.copy(epgUrl = parsed.declaredEpgUrl))
         }
-
-        sourceDao.markCatalogSynced(source.id, nowUtcMillis)
-        return SyncResult.Success(parsed.channels.size, 0, 0)
+        if (hide.isNotEmpty()) categoryDao.deleteIds(sourceId, hide)
+        if (fresh.isNotEmpty()) {
+            categoryDao.deleteIds(sourceId, fresh.map { it.id })
+            categoryDao.upsertAll(fresh)
+        }
     }
 
     /**
@@ -793,43 +1114,256 @@ class CatalogRepository(
     private fun normalized(
         channels: List<Channel>,
         categoryNames: Map<String, String>,
-    ): List<Channel> {
-        val stamped = channels.map { channel ->
-            val n = ChannelNameNormalizer.normalize(channel.name)
-            var rank = n.qualityRank
-            var label = n.qualityLabel
-            if (label.isEmpty() || rank == 0) {
-                // Some providers put the quality in the CATEGORY, not the channel:
-                // 'UK| GENERAL HD/RAW' and 'UK| GENERAL hevc' holding identically named
-                // channels. Without this, the player's switch is four buttons all
-                // reading 'Standard' — grouped correctly, labelled uselessly.
-                val categoryName = channel.categoryId?.let { categoryNames[it] }
-                if (categoryName != null) {
-                    val c = ChannelNameNormalizer.normalize(categoryName)
-                    if (label.isEmpty()) label = c.qualityLabel
-                    if (rank == 0) rank = c.qualityRank
-                }
-            }
-            channel.copy(
-                displayName = n.baseName,
-                groupKey = n.groupKey,
-                qualityRank = rank,
-                qualityLabel = label,
-                // Providers ship decorative separator rows ('#### UK GENERAL ####') as
-                // channels. They are headings, not channels — hide them on import.
-                hidden = channel.hidden || isSeparatorRow(channel.name),
-            )
-        }
+    ): List<Channel> = channels.map { normalizeOne(it, categoryNames) }
 
-        return stamped
+    private fun normalizeOne(channel: Channel, categoryNames: Map<String, String>): Channel {
+        val n = ChannelNameNormalizer.normalize(channel.name)
+        var rank = n.qualityRank
+        var label = n.qualityLabel
+        if (label.isEmpty() || rank == 0) {
+            // Some providers put the quality in the CATEGORY, not the channel:
+            // 'UK| GENERAL HD/RAW' and 'UK| GENERAL hevc' holding identically named
+            // channels. Without this, the player's switch is four buttons all
+            // reading 'Standard' — grouped correctly, labelled uselessly.
+            val categoryName = channel.categoryId?.let { categoryNames[it] }
+            if (categoryName != null) {
+                val c = ChannelNameNormalizer.normalize(categoryName)
+                if (label.isEmpty()) label = c.qualityLabel
+                if (rank == 0) rank = c.qualityRank
+            }
+        }
+        return channel.copy(
+            displayName = n.baseName,
+            groupKey = n.groupKey,
+            qualityRank = rank,
+            qualityLabel = label,
+            hidden = channel.hidden || isSeparatorRow(channel.name),
+        )
     }
 
-    /** Decorative list headings: starts AND ends with a run of banner characters. */
-    private fun isSeparatorRow(rawName: String): Boolean {
-        val t = rawName.trim()
-        return t.length >= 6 &&
-            t.take(3).all { it in SEPARATOR_CHARS } &&
-            t.takeLast(3).all { it in SEPARATOR_CHARS }
+    private suspend fun writeXtreamChannels(
+        source: Source,
+        categoryNames: Map<String, String>,
+        nowUtcMillis: Long,
+        meter: LoadMeter?,
+    ): Int {
+        val seen = LongOpenSet()
+        val batch = ArrayList<Channel>(CATALOGUE_BATCH)
+        var accepted = 0
+        api.streamLive(
+            source,
+            onLength = { length -> meter?.begin(LoadStep.CHANNELS, length) },
+            onBytes = { read -> meter?.setBytes(read) },
+        ) { channel ->
+            currentCoroutineContext().ensureActive()
+            if (!seen.add(fnv64(channel.streamId))) return@streamLive
+            batch += normalizeOne(channel, categoryNames)
+            accepted++
+            if (batch.size >= CATALOGUE_BATCH) {
+                flushChannels(source.id, batch, nowUtcMillis)
+                batch.clear()
+                meter?.setItems(accepted)
+                LoadTrace.mark("xtream batch n=$accepted")
+            }
+        }
+        if (batch.isNotEmpty()) {
+            flushChannels(source.id, batch, nowUtcMillis)
+            meter?.setItems(accepted)
+            LoadTrace.mark("xtream batch n=$accepted")
+        }
+        remember(source.id, "channels", meter?.endStep(accepted) ?: -1L)
+        return accepted
+    }
+
+    private suspend fun writeMovies(
+        source: Source,
+        syncStamp: Long,
+        categoryNames: Map<String, String>,
+        meter: LoadMeter?,
+    ) {
+        val seen = LongOpenSet()
+        val batch = ArrayList<Movie>(CATALOGUE_BATCH)
+        var accepted = 0
+        api.streamMovies(
+            source,
+            onLength = { length -> meter?.begin(LoadStep.MOVIES, length) },
+            onBytes = { read -> meter?.setBytes(read) },
+        ) { movie ->
+            currentCoroutineContext().ensureActive()
+            if (!seen.add(fnv64(movie.streamId))) return@streamMovies
+            batch += movie
+            accepted++
+            if (batch.size >= CATALOGUE_BATCH) {
+                flushMovies(source.id, batch, syncStamp, categoryNames)
+                batch.clear()
+                meter?.setItems(accepted)
+                LoadTrace.mark("movies batch n=$accepted")
+            }
+        }
+        if (batch.isNotEmpty()) flushMovies(source.id, batch, syncStamp, categoryNames)
+        remember(source.id, "movies", meter?.endStep(accepted) ?: -1L)
+    }
+
+    private suspend fun writeSeries(
+        source: Source,
+        syncStamp: Long,
+        categoryNames: Map<String, String>,
+        meter: LoadMeter?,
+    ) {
+        val seen = LongOpenSet()
+        val batch = ArrayList<Series>(CATALOGUE_BATCH)
+        var accepted = 0
+        api.streamSeries(
+            source,
+            onLength = { length -> meter?.begin(LoadStep.SERIES, length) },
+            onBytes = { read -> meter?.setBytes(read) },
+        ) { item ->
+            currentCoroutineContext().ensureActive()
+            if (!seen.add(fnv64(item.seriesId))) return@streamSeries
+            batch += item
+            accepted++
+            if (batch.size >= CATALOGUE_BATCH) {
+                flushSeries(source.id, batch, syncStamp, categoryNames)
+                batch.clear()
+                meter?.setItems(accepted)
+                LoadTrace.mark("series batch n=$accepted")
+            }
+        }
+        if (batch.isNotEmpty()) flushSeries(source.id, batch, syncStamp, categoryNames)
+        remember(source.id, "series", meter?.endStep(accepted) ?: -1L)
+    }
+
+    private suspend fun flushChannels(sourceId: Long, batch: List<Channel>, syncStamp: Long) {
+        if (batch.isEmpty()) return
+        val state = channelDao.userStateForStreamIds(sourceId, batch.map { it.streamId })
+            .associateBy { it.streamId }
+        val fresh = ArrayList<Channel>()
+        val known = ArrayList<Channel>()
+        for (channel in batch) {
+            val previous = state[channel.streamId]
+            if (previous == null) {
+                fresh += channel.copy(lastSeenMillis = syncStamp)
+            } else {
+                known += channel.copy(
+                    id = previous.id,
+                    favourite = previous.favourite,
+                    hidden = previous.hidden || channel.hidden,
+                    sortIndex = previous.sortIndex,
+                    customName = previous.customName,
+                    epgOverrideId = previous.epgOverrideId,
+                    matchedEpgId = previous.matchedEpgId,
+                    lastSeenMillis = syncStamp,
+                )
+            }
+        }
+        if (fresh.isNotEmpty()) channelDao.insertIgnore(fresh)
+        if (known.isNotEmpty()) channelDao.updateAll(known)
+    }
+
+    private suspend fun flushMovies(
+        sourceId: Long,
+        batch: List<Movie>,
+        syncStamp: Long,
+        categoryNames: Map<String, String>,
+    ) {
+        if (batch.isEmpty()) return
+        val state = movieDao.userStateForStreamIds(sourceId, batch.map { it.streamId })
+            .associateBy { it.streamId }
+        val fresh = ArrayList<Movie>()
+        val known = ArrayList<Movie>()
+        val categories = LinkedHashMap<String, Category>()
+        for (movie in batch) {
+            val stamped = movie.copy(lastSeenMillis = syncStamp)
+            val previous = state[movie.streamId]
+            if (previous == null) fresh += stamped
+            else known += stamped.copy(id = previous.id, favourite = previous.favourite)
+            val categoryId = movie.categoryId?.takeIf { it.isNotBlank() } ?: continue
+            if (categoryId !in categories) {
+                categories[categoryId] = Category(
+                    id = categoryId,
+                    sourceId = sourceId,
+                    name = categoryNames[categoryId] ?: categoryId,
+                    kind = StreamKind.MOVIE,
+                    sortIndex = categories.size,
+                )
+            }
+        }
+        if (fresh.isNotEmpty()) movieDao.insertIgnore(fresh)
+        if (known.isNotEmpty()) movieDao.updateAll(known)
+        if (categories.isNotEmpty()) categoryDao.insertIgnore(categories.values.toList())
+    }
+
+    private suspend fun flushSeries(
+        sourceId: Long,
+        batch: List<Series>,
+        syncStamp: Long,
+        categoryNames: Map<String, String>,
+    ) {
+        if (batch.isEmpty()) return
+        val state = seriesDao.userStateForSeriesIds(sourceId, batch.map { it.seriesId })
+            .associateBy { it.seriesId }
+        val fresh = ArrayList<Series>()
+        val known = ArrayList<Series>()
+        val categories = LinkedHashMap<String, Category>()
+        for (item in batch) {
+            val stamped = item.copy(lastSeenMillis = syncStamp)
+            val previous = state[item.seriesId]
+            if (previous == null) fresh += stamped
+            else known += stamped.copy(id = previous.id, favourite = previous.favourite)
+            val categoryId = item.categoryId?.takeIf { it.isNotBlank() } ?: continue
+            if (categoryId !in categories) {
+                categories[categoryId] = Category(
+                    id = categoryId,
+                    sourceId = sourceId,
+                    name = categoryNames[categoryId] ?: categoryId,
+                    kind = StreamKind.SERIES,
+                    sortIndex = categories.size,
+                )
+            }
+        }
+        if (fresh.isNotEmpty()) seriesDao.insertIgnore(fresh)
+        if (known.isNotEmpty()) seriesDao.updateAll(known)
+        if (categories.isNotEmpty()) categoryDao.insertIgnore(categories.values.toList())
+    }
+
+    private fun probeStep(source: Source, step: LoadStep): Long {
+        val key = when (step) {
+            LoadStep.CHANNELS -> "channels"
+            LoadStep.MOVIES -> "movies"
+            LoadStep.SERIES -> "series"
+            else -> return -1L
+        }
+        val url = when (step) {
+            LoadStep.CHANNELS -> when (source.kind) {
+                SourceKind.M3U -> source.url
+                SourceKind.XTREAM -> api.actionUrl(source, "get_live_streams").toString()
+                SourceKind.STALKER -> null
+            }
+            LoadStep.MOVIES -> api.actionUrl(source, "get_vod_streams").toString()
+            LoadStep.SERIES -> api.actionUrl(source, "get_series").toString()
+            else -> null
+        }
+        val probed = if (url.isNullOrBlank()) -1L else probeLength(url, source.userAgent)
+        return if (probed > 0) probed else settings.loadBytes(source.id, key)
+    }
+
+    private fun probeLength(url: String, userAgent: String): Long {
+        return try {
+            val request = Request.Builder().url(url).head().header("User-Agent", userAgent).build()
+            http.newCall(request).execute().use { response ->
+                response.body?.close()
+                if (response.code == 405 || response.code == 501) return -1L
+                response.header("Content-Length")?.toLongOrNull() ?: -1L
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            -1L
+        }
+    }
+
+    private fun remember(sourceId: Long, step: String, bytes: Long) {
+        settings.saveLoadBytes(sourceId, step, bytes)
     }
 
     /**
@@ -842,24 +1376,26 @@ class CatalogRepository(
      * on the next launch instead of the next sync. Bump [NORMALIZER_VERSION] to trigger it.
      */
     suspend fun renormalizeAll(): Int = withContext(Dispatchers.IO) {
-        val existing = channelDao.allForMatching()
-        if (existing.isEmpty()) return@withContext 0
-
-        val bySource = existing.groupBy { it.sourceId }
+        var afterId = 0L
         var changed = 0
-        for ((_, channels) in bySource) {
-            val names = channelCategoryNames(channels)
-            val renamed = normalized(channels, names)
-            // Only write rows that actually changed, to keep the write small.
-            val diff = renamed.filterIndexed { i, c ->
-                val old = channels[i]
-                c.displayName != old.displayName || c.groupKey != old.groupKey ||
-                    c.qualityLabel != old.qualityLabel || c.qualityRank != old.qualityRank ||
-                    c.hidden != old.hidden
-            }
-            if (diff.isNotEmpty()) {
-                diff.chunked(500).forEach { channelDao.upsertAll(it) }
-                changed += diff.size
+        while (true) {
+            val existing = channelDao.pageAfterId(afterId, MATCH_PAGE)
+            if (existing.isEmpty()) break
+            afterId = existing.last().id
+            val bySource = existing.groupBy { it.sourceId }
+            for ((_, channels) in bySource) {
+                val names = channelCategoryNames(channels)
+                val renamed = normalized(channels, names)
+                val diff = renamed.filterIndexed { i, c ->
+                    val old = channels[i]
+                    c.displayName != old.displayName || c.groupKey != old.groupKey ||
+                        c.qualityLabel != old.qualityLabel || c.qualityRank != old.qualityRank ||
+                        c.hidden != old.hidden
+                }
+                if (diff.isNotEmpty()) {
+                    channelDao.updateAll(diff)
+                    changed += diff.size
+                }
             }
         }
         Log.i(TAG, "Re-normalised $changed channels with the current normaliser")
@@ -915,10 +1451,15 @@ class CatalogRepository(
         if (source.kind != SourceKind.XTREAM || source.liveFormat == format) return@withContext
         val updated = source.copy(liveFormat = format)
         sourceDao.update(updated)
-        // Rebuild each live channel's URL for the new container.
-        channelDao.forSource(sourceId).forEach { channel ->
-            val newUrl = api.liveStreamUrl(updated, channel.streamId)
-            if (newUrl != channel.streamUrl) channelDao.updateStreamUrl(channel.id, newUrl)
+        var afterId = 0L
+        while (true) {
+            val page = channelDao.pageForSource(sourceId, afterId, MATCH_PAGE)
+            if (page.isEmpty()) break
+            afterId = page.last().id
+            for (channel in page) {
+                val newUrl = api.liveStreamUrl(updated, channel.streamId)
+                if (newUrl != channel.streamUrl) channelDao.updateStreamUrl(channel.id, newUrl)
+            }
         }
     }
 
@@ -933,7 +1474,18 @@ class CatalogRepository(
 
     companion object {
         private const val TAG = "CatalogRepository"
-        val SEPARATOR_CHARS = setOf('#', '*', '=', '~', '-', '_', '•', '█', '▓', '|')
+
+        /** Rows per catalogue write. Under SQLite's 999-variable cap on the state lookup. */
+        const val CATALOGUE_BATCH = 300
+
+        /** Rows per id-cursor walk of the channel table. */
+        private const val MATCH_PAGE = 500
+
+        const val TOO_LARGE =
+            "This list is too large to finish. What was already saved is kept. Try again."
+
+        const val PARTIAL =
+            "The download stopped before the end. What was already saved is kept."
 
         /**
          * Bump this whenever the normaliser changes in a way that should re-process

@@ -71,10 +71,12 @@ import android.widget.Toast
 import androidx.compose.ui.window.Dialog
 import app.opentv.R
 import app.opentv.core.AppSettings
+import app.opentv.core.MemoryGovernor
 import app.opentv.core.ServiceLocator
 import app.opentv.core.findActivity
 import app.opentv.core.requestIgnoreBatteryOptimizations
 import app.opentv.data.model.Channel
+import app.opentv.data.model.GuideSlot
 import app.opentv.data.model.Programme
 import app.opentv.data.model.Reminder
 import app.opentv.data.model.shownName
@@ -84,6 +86,7 @@ import app.opentv.player.PlayerController
 import app.opentv.ui.ChannelsViewModel
 import app.opentv.ui.RecordingBackgroundDialog
 import app.opentv.ui.RecordingBackgroundPrompt
+import app.opentv.ui.rememberSizedImage
 import coil.compose.AsyncImage
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -121,6 +124,12 @@ fun HomeScreen(
     val graph = remember { ServiceLocator.get(context) }
     val settings = remember { graph.settings }
     val previewEnabled by settings.guidePreviewVideo.collectAsState()
+    val liteMode by settings.liteMode.collectAsState()
+    val memory by remember { MemoryGovernor.get(context) }.snapshot.collectAsState()
+    // LITE never opens the second decoder. Critical memory pressure stops it even in the normal
+    // profile. The saved preview preference is left alone, so turning LITE off brings it back.
+    val previewBlocked = liteMode || memory.pressure == MemoryGovernor.Pressure.CRITICAL
+    val previewActive = previewEnabled && !previewBlocked
     val channelLayout by settings.channelLayout.collectAsState()
 
     val categories by viewModel.visibleCategoryGroups.collectAsState()
@@ -135,6 +144,10 @@ fun HomeScreen(
     // Tri-state: null = still checking the catalogue, true = channels on disk, false = confirmed
     // empty. Drives the choice between the loading spinner and a recoverable error below.
     val channelsPresent by viewModel.channelsPresent.collectAsState()
+    val rowsSettled by viewModel.rowsSettled.collectAsState()
+    val catalogueWide by viewModel.catalogueWide.collectAsState()
+    val channelTotal by viewModel.visibleChannelCount.collectAsState()
+    val loadSnapshot by app.opentv.core.StatusBus.snapshot.collectAsState()
 
     // Two separate ideas, on purpose:
     //  - highlightedRow: where the d-pad is in the grid. Moves freely with up/down.
@@ -202,20 +215,32 @@ fun HomeScreen(
         selectedRow = rows.firstOrNull { it.key == selectedRow?.key } ?: rows.firstOrNull()
     }
 
+    // The time-grid only keeps a full day of programmes for the rows around the focus when the
+    // category is large. Reporting the index lets that slice follow the d-pad without reloading
+    // the whole guide. List layout never reads those programmes.
+    LaunchedEffect(highlightedRow?.key, channelLayout) {
+        if (channelLayout != AppSettings.ChannelLayout.GRID) return@LaunchedEffect
+        val key = highlightedRow?.key ?: return@LaunchedEffect
+        val index = rows.indexOfFirst { it.key == key }
+        if (index >= 0) viewModel.setGuideFocus(index)
+    }
+
     // ---- Live preview player -----------------------------------------------------------------
-    // One muted player, reused. It only ever decodes while the guide is the foreground screen,
-    // and is stopped before any hand-off to full-screen, so the box never runs two decoders at
-    // once — the thing that used to lock up cheap sticks.
+    // One muted player, reused, and only when LITE is off. It only ever decodes while the guide
+    // is the foreground screen, and is stopped before any hand-off to full-screen, so the box
+    // never runs two decoders at once — the thing that used to lock up cheap sticks. LITE does
+    // not construct the player at all.
     val previewScope = remember { CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate) }
-    val previewController = remember {
-        PlayerController(context, previewScope, graph.httpClient, subtitlesEnabled = false, preview = true)
+    val previewController = remember(liteMode) {
+        if (liteMode) null
+        else PlayerController(context, previewScope, graph.httpClient, subtitlesEnabled = false, preview = true)
             .also { it.player.volume = 0f }
     }
+    DisposableEffect(previewController) {
+        onDispose { previewController?.release() }
+    }
     DisposableEffect(Unit) {
-        onDispose {
-            previewController.release()
-            previewScope.cancel()
-        }
+        onDispose { previewScope.cancel() }
     }
 
     // Watching a live channel while a recording runs opens a second stream on the same line — which
@@ -226,7 +251,7 @@ fun HomeScreen(
         PlaybackQueue.items = rows.map {
             PlaybackQueue.Item(it.primary.id, it.primary.shownName, it.primary.logoUrl, it.primary.number)
         }
-        previewController.stop()
+        previewController?.stop()
         onPlayChannel(channel)
     }
     fun requestLive(channel: Channel) {
@@ -235,13 +260,13 @@ fun HomeScreen(
 
     val lifecycleOwner = LocalLifecycleOwner.current
     var screenResumed by remember { mutableStateOf(true) }
-    DisposableEffect(lifecycleOwner) {
+    DisposableEffect(lifecycleOwner, previewController) {
         val observer = LifecycleEventObserver { _, event ->
             when (event) {
                 Lifecycle.Event.ON_RESUME -> screenResumed = true
                 Lifecycle.Event.ON_PAUSE -> {
                     screenResumed = false
-                    previewController.stop()
+                    previewController?.stop()
                 }
                 else -> Unit
             }
@@ -252,9 +277,9 @@ fun HomeScreen(
 
     // Hold the screen awake while the guide's live preview is playing — otherwise the box's
     // screensaver fires while you're browsing with a channel running in the preview pane.
-    DisposableEffect(previewEnabled, screenResumed) {
+    DisposableEffect(previewActive, screenResumed) {
         val window = context.findActivity()?.window
-        if (previewEnabled && screenResumed) {
+        if (previewActive && screenResumed && previewController != null) {
             window?.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         } else {
             window?.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
@@ -263,8 +288,8 @@ fun HomeScreen(
     }
 
     // Preview audio follows the setting; muted by default so browsing stays quiet.
-    LaunchedEffect(previewSound) {
-        previewController.player.volume = if (previewSound) 1f else 0f
+    LaunchedEffect(previewSound, previewController) {
+        previewController?.player?.volume = if (previewSound) 1f else 0f
     }
 
     // Tune the preview to the highlighted channel, so it follows the d-pad as you browse — the
@@ -272,15 +297,16 @@ fun HomeScreen(
     // While a recording is running the preview is silenced entirely: on a single-connection line a
     // muted preview is still a second stream, which fights the recording and risks a provider ban.
     val recordingActive = activeRecordings.isNotEmpty()
-    LaunchedEffect(highlightedRow?.key, previewEnabled, screenResumed, recordingActive) {
+    LaunchedEffect(highlightedRow?.key, previewActive, screenResumed, recordingActive, previewController) {
+        val player = previewController
         val row = highlightedRow
-        if (!previewEnabled || !screenResumed || recordingActive || row == null) {
-            previewController.stop()
+        if (player == null || !previewActive || !screenResumed || recordingActive || row == null) {
+            player?.stop()
             return@LaunchedEffect
         }
         val channel = row.primary
         val source = graph.sourceRepository.byId(channel.sourceId)
-        previewController.play(
+        player.play(
             PlayerController.Request(
                 url = channel.streamUrl,
                 title = channel.shownName,
@@ -379,17 +405,14 @@ fun HomeScreen(
             if (rows.isEmpty()) {
                 when {
                     favouritesOnly -> NoFavouritesState()
-                    // Work genuinely in progress: a sync is running, the catalogue check hasn't
-                    // returned yet, or channels ARE on disk and the guide is still building. A
-                    // large provider takes a while, and showing "No channels" during it reads as
-                    // failure — which is how someone concludes an app is broken thirty seconds
-                    // after installing it.
-                    isSyncing || channelsPresent == null || channelsPresent == true -> LoadingState(isSyncing)
-                    // Nothing is syncing and the catalogue is confirmed empty. With a provider
-                    // configured, the last load failed or returned nothing — surface a clear error
-                    // with Retry and a way back to setup instead of spinning forever.
-                    hasSources -> ChannelsErrorState(onRetry = onRefresh, onEditProvider = onAddSource)
-                    else -> EmptyState(onAddSource)
+                    catalogueWide && loadSnapshot?.step != app.opentv.core.LoadStep.CHANNELS ->
+                        WideCatalogueState(channelTotal)
+                    !rowsSettled || isSyncing || loadSnapshot != null || channelsPresent == null ->
+                        LoadingState(isSyncing)
+                    channelsPresent == false && hasSources ->
+                        ChannelsErrorState(onRetry = onRefresh, onEditProvider = onAddSource)
+                    channelsPresent == false -> EmptyState(onAddSource)
+                    else -> EmptyCategoryState()
                 }
             } else {
                 // Hand the player the list you're browsing so it can zap channel up/down.
@@ -404,7 +427,10 @@ fun HomeScreen(
                         graph.recordingEngine.stop(active.id)
                         Toast.makeText(context, context.getString(R.string.rec_recording_stopped), Toast.LENGTH_SHORT).show()
                     } else {
-                        recordScope.launch { graph.recordingEngine.startChannel(row.primary, row.now) }
+                        recordScope.launch {
+                            val programme = row.now?.let { fullProgramme(graph, it) }
+                            graph.recordingEngine.startChannel(row.primary, programme)
+                        }
                         Toast.makeText(context, context.getString(R.string.rec_recording_started_see_tab, row.primary.shownName), Toast.LENGTH_LONG).show()
                         promptBackgroundIfNeeded()
                     }
@@ -423,7 +449,7 @@ fun HomeScreen(
                     onWatch = { highlightedRow?.let { goFullscreen(it.primary) } },
                     onRefresh = onRefresh,
                     onAddSource = onAddSource,
-                    previewPlayer = if (previewEnabled && !recordingActive) previewController.player else null,
+                    previewPlayer = if (previewActive && !recordingActive) previewController?.player else null,
                     isRecording = highlightedRow?.primary?.id?.let { id ->
                         activeRecordings.any { it.channelId == id }
                     } == true,
@@ -456,6 +482,7 @@ fun HomeScreen(
                         onFocusRow = onFocusChannel,
                         onToggleFavourite = { viewModel.toggleFavourite(it) },
                         onExitLeftFromChannel = onExitLeftChannel,
+                        onNearEnd = viewModel::loadMoreChannels,
                         modifier = Modifier.weight(1f).padding(start = 12.dp, end = 12.dp),
                     )
                 } else {
@@ -468,9 +495,12 @@ fun HomeScreen(
                         // Record series. The preview already follows the highlight as you browse.
                         onSelectRow = { row -> channelMenu = row },
                         onFocusRow = onFocusChannel,
-                        onProgramme = { row, programme -> recordTarget = row to programme },
+                        onProgramme = { row, slot ->
+                            recordScope.launch { recordTarget = row to fullProgramme(graph, slot) }
+                        },
                         onToggleFavourite = { viewModel.toggleFavourite(it) },
                         onExitLeftFromChannel = onExitLeftChannel,
+                        onNearEnd = viewModel::loadMoreChannels,
                         modifier = Modifier.weight(1f).padding(start = 12.dp, end = 12.dp),
                     )
                 }
@@ -753,7 +783,9 @@ fun HomeScreen(
                         }
                     } else {
                         RecordActionRow(stringResource(R.string.guide_record_now_playing), primary = true) {
-                            recordScope.launch { graph.recordingEngine.startChannel(channel, nowProg) }
+                            recordScope.launch {
+                                graph.recordingEngine.startChannel(channel, nowProg?.let { fullProgramme(graph, it) })
+                            }
                             Toast.makeText(context, context.getString(R.string.rec_recording_started_see_tab, channel.shownName), Toast.LENGTH_LONG).show()
                             promptBackgroundIfNeeded()
                             channelMenu = null
@@ -762,7 +794,7 @@ fun HomeScreen(
                     if (nowProg != null) {
                         RecordActionRow(stringResource(R.string.rec_record_series_named, nowProg.title)) {
                             recordScope.launch {
-                                graph.recordingEngine.recordSeries(channel, nowProg, menuRow.programmes)
+                                graph.recordingEngine.recordSeries(channel, fullProgramme(graph, nowProg), menuRow.programmes)
                             }
                             Toast.makeText(context, context.getString(R.string.rec_series_recording_set, nowProg.title), Toast.LENGTH_LONG).show()
                             promptBackgroundIfNeeded()
@@ -777,12 +809,13 @@ fun HomeScreen(
                             color = MaterialTheme.colorScheme.primary,
                             modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
                         )
-                        upcoming.forEach { programme ->
-                            RecordActionRow("${formatTime(programme.startUtcMillis)}   ${programme.title}") {
+                        upcoming.forEach { slot ->
+                            RecordActionRow("${formatTime(slot.startUtcMillis)}   ${slot.title}") {
                                 // Open the programme dialog so the choice is record, remind or auto-switch —
-                                // not a surprise one-tap recording.
+                                // not a surprise one-tap recording. The full row (description included)
+                                // is one lookup, not the whole guide.
                                 channelMenu = null
-                                recordTarget = menuRow to programme
+                                recordScope.launch { recordTarget = menuRow to fullProgramme(graph, slot) }
                             }
                         }
                     }
@@ -802,6 +835,10 @@ fun HomeScreen(
         )
     }
 }
+
+/** The guide keeps [GuideSlot]s. Recording and reminders want the full row, description included. */
+private suspend fun fullProgramme(graph: ServiceLocator.Graph, slot: GuideSlot): Programme =
+    graph.epgRepository.programme(slot.id) ?: slot.asProgramme()
 
 /** Inserts a reminder for a future programme and arms its alarm. No-op if one already exists. */
 private suspend fun setReminder(
@@ -928,7 +965,7 @@ private fun ChannelRow(
         verticalAlignment = Alignment.CenterVertically,
     ) {
         AsyncImage(
-            model = row.primary.logoUrl,
+            model = rememberSizedImage(row.primary.logoUrl, 48.dp, 48.dp),
             contentDescription = null,
             modifier = Modifier
                 .size(48.dp)
@@ -989,46 +1026,98 @@ private fun ChannelRow(
 
 @Composable
 private fun LoadingState(isSyncing: Boolean) {
-    val s by app.opentv.core.StatusBus.message.collectAsState()
-    val p by app.opentv.core.StatusBus.progress.collectAsState()
-    val status = s
-    val progress = p
+    LaunchedEffect(isSyncing) {
+        app.opentv.core.LoadTrace.mark("loading channels screen syncing=$isSyncing")
+    }
+    val snapshot by app.opentv.core.StatusBus.snapshot.collectAsState()
+    val status by app.opentv.core.StatusBus.message.collectAsState()
+    val bar by app.opentv.core.StatusBus.progress.collectAsState()
+    val snap = snapshot
     Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
         Column(
             horizontalAlignment = Alignment.CenterHorizontally,
             modifier = Modifier.widthIn(max = 460.dp),
         ) {
-            if (progress == null) {
-                CircularProgressIndicator()
+            if (snap != null) {
+                val percent = app.opentv.ui.loadPercent(snap)
+                if (percent == null) {
+                    CircularProgressIndicator()
+                } else {
+                    Text(
+                        percent,
+                        style = MaterialTheme.typography.headlineMedium,
+                        color = MaterialTheme.colorScheme.primary,
+                    )
+                }
+                Spacer(Modifier.height(12.dp))
+                Text(app.opentv.ui.loadStepLabel(snap), style = MaterialTheme.typography.headlineSmall)
+                val fraction = snap.fraction
+                if (fraction != null) {
+                    Spacer(Modifier.height(20.dp))
+                    LinearProgressIndicator(
+                        progress = { fraction },
+                        modifier = Modifier.fillMaxWidth().height(6.dp),
+                    )
+                }
             } else {
+                val fraction = bar
+                if (fraction == null) {
+                    CircularProgressIndicator()
+                } else {
+                    Text(
+                        "${(fraction * 100).toInt()}%",
+                        style = MaterialTheme.typography.headlineMedium,
+                        color = MaterialTheme.colorScheme.primary,
+                    )
+                }
+                Spacer(Modifier.height(12.dp))
                 Text(
-                    "${(progress * 100).toInt()}%",
-                    style = MaterialTheme.typography.headlineMedium,
-                    color = MaterialTheme.colorScheme.primary,
+                    status ?: stringResource(R.string.guide_loading_channels),
+                    style = MaterialTheme.typography.headlineSmall,
+                    textAlign = TextAlign.Center,
                 )
+                if (fraction != null) {
+                    Spacer(Modifier.height(20.dp))
+                    LinearProgressIndicator(
+                        progress = { fraction },
+                        modifier = Modifier.fillMaxWidth().height(6.dp),
+                    )
+                }
             }
-            Spacer(Modifier.height(20.dp))
-            Text(stringResource(R.string.guide_loading_channels), style = MaterialTheme.typography.headlineSmall)
+        }
+    }
+}
+
+@Composable
+private fun EmptyCategoryState() {
+    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+        Text(
+            stringResource(R.string.guide_empty_category),
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            textAlign = TextAlign.Center,
+        )
+    }
+}
+
+@Composable
+private fun WideCatalogueState(count: Int) {
+    val shown = java.text.NumberFormat.getIntegerInstance().format(count)
+    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            modifier = Modifier.widthIn(max = 460.dp),
+        ) {
+            Text(
+                stringResource(R.string.guide_wide_title, shown),
+                style = MaterialTheme.typography.headlineSmall,
+                textAlign = TextAlign.Center,
+            )
             Spacer(Modifier.height(8.dp))
             Text(
-                when {
-                    // Actively assembling — this is work in progress, not a failure.
-                    status != null -> status
-                    isSyncing -> stringResource(R.string.guide_fetching_desc)
-                    // Channels are already on the device; the guide is being built from them.
-                    // A big provider takes a moment (longer on this debug build) — not a failure.
-                    else -> stringResource(R.string.guide_building_desc)
-                },
+                stringResource(R.string.guide_wide_desc),
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 textAlign = TextAlign.Center,
             )
-            if (progress != null) {
-                Spacer(Modifier.height(20.dp))
-                LinearProgressIndicator(
-                    progress = { progress },
-                    modifier = Modifier.fillMaxWidth().height(6.dp),
-                )
-            }
         }
     }
 }

@@ -5,65 +5,85 @@
  */
 package app.opentv.data.parser
 
+import app.opentv.core.LongOpenSet
 import app.opentv.data.model.Channel
 import java.io.BufferedReader
-import java.io.InputStream
+import kotlinx.coroutines.runBlocking
 
 /**
  * Streaming M3U/M3U8 playlist parser.
  *
- * Deliberately reads line-by-line rather than loading the whole playlist into memory:
- * real provider playlists routinely run to tens of megabytes and 50,000+ entries, and
- * loading that as a single String is a reliable way to OOM a cheap Android TV box.
+ * Reads one line at a time and hands each accepted channel to [parse]'s callback. The caller
+ * decides when to write. Nothing here keeps the playlist: a few hundred thousand entries must
+ * not become a few hundred thousand objects sitting in a list until the file ends.
  *
- * Tolerant by design. A malformed entry is skipped, not fatal — one bad line in a
- * 40,000-line playlist must never cost the user their entire channel list.
+ * Tolerant by design. A malformed entry is skipped, not fatal — one bad line in a large
+ * playlist must never cost the user their entire channel list.
  */
 object M3uParser {
 
-    private val ATTRIBUTE_REGEX = Regex("""([\w-]+)="([^"]*)"""")
+    data class Header(
+        /** Value of `url-tvg` / `x-tvg-url` on the #EXTM3U header, if the playlist declares one. */
+        val declaredEpgUrl: String?,
+        val skippedEntries: Int,
+        /** Distinct `group-title` values, in the order they first appeared. */
+        val categories: List<String>,
+    )
 
+    /**
+     * Collected result for tests and other callers that already hold a small playlist in a
+     * string. The sync path does not use this — it streams straight into the database.
+     */
     data class Result(
         val channels: List<Channel>,
-        /** Value of `url-tvg`/`x-tvg-url` on the #EXTM3U header, if the playlist declares one. */
         val declaredEpgUrl: String?,
         val skippedEntries: Int,
     )
 
-    fun parse(input: InputStream, sourceId: Long): Result =
-        input.bufferedReader().use { parse(it, sourceId) }
-
-    fun parse(text: String, sourceId: Long): Result =
-        parse(text.reader().buffered(), sourceId)
-
-    fun parse(reader: BufferedReader, sourceId: Long): Result {
+    fun parse(text: String, sourceId: Long): Result = runBlocking {
         val channels = ArrayList<Channel>()
-        val seenStreamIds = HashSet<String>()
+        val header = parse(text.reader().buffered(), sourceId) { channels += it }
+        Result(channels, header.declaredEpgUrl, header.skippedEntries)
+    }
+
+    suspend fun parse(
+        reader: BufferedReader,
+        sourceId: Long,
+        onChannel: suspend (Channel) -> Unit,
+    ): Header {
+        val seen = LongOpenSet()
+        val categories = LinkedHashSet<String>()
         var declaredEpgUrl: String? = null
         var skipped = 0
-
         var pendingName: String? = null
-        var pendingAttributes: Map<String, String> = emptyMap()
+        var pendingTvgId: String? = null
+        var pendingTvgName: String? = null
+        var pendingLogo: String? = null
+        var pendingGroup: String? = null
         var pendingNumber: Int? = null
-        // #EXTVLCOPT / #EXTHTTP lines that apply to the next URL.
+        var pendingXui: String? = null
         var index = 0
 
-        reader.forEachLine { rawLine ->
+        while (true) {
+            val rawLine = reader.readLine() ?: break
             val line = rawLine.trim()
             when {
                 line.isEmpty() -> Unit
 
                 line.startsWith("#EXTM3U", ignoreCase = true) -> {
-                    val attributes = parseAttributes(line)
-                    declaredEpgUrl = attributes["url-tvg"]
-                        ?: attributes["x-tvg-url"]
+                    declaredEpgUrl = attribute(line, "url-tvg")
+                        ?: attribute(line, "x-tvg-url")
                         ?: declaredEpgUrl
                 }
 
                 line.startsWith("#EXTINF", ignoreCase = true) -> {
-                    pendingAttributes = parseAttributes(line)
-                    pendingName = displayNameOf(line, pendingAttributes)
-                    pendingNumber = pendingAttributes["tvg-chno"]?.toIntOrNull()
+                    pendingTvgId = attribute(line, "tvg-id")
+                    pendingTvgName = attribute(line, "tvg-name")
+                    pendingLogo = attribute(line, "tvg-logo") ?: attribute(line, "logo")
+                    pendingGroup = attribute(line, "group-title")
+                    pendingNumber = attribute(line, "tvg-chno")?.toIntOrNull()
+                    pendingXui = attribute(line, "xui-id")
+                    pendingName = displayNameOf(line, pendingTvgName)
                 }
 
                 // Any other directive: ignore, but keep the pending EXTINF alive.
@@ -72,41 +92,46 @@ object M3uParser {
                 else -> {
                     val name = pendingName
                     if (name.isNullOrBlank()) {
-                        // A URL with no preceding #EXTINF. Nothing sensible to label it with.
                         skipped++
                     } else {
-                        val attributes = pendingAttributes
-                        val streamId = attributes["tvg-id"]
+                        // xui-id is one row. tvg-id is the guide id and is often shared by
+                        // different affiliates, so it must not be the row identity.
+                        val streamId = pendingXui
                             ?.takeIf { it.isNotBlank() }
-                            ?.let { "tvg:$it" }
-                            ?: "url:${stableHash(line)}"
-
-                        // Providers repeat the same tvg-id across quality variants. Keep the
-                        // first and drop later duplicates rather than letting them collide on
-                        // the unique index and abort the whole import.
-                        if (seenStreamIds.add(streamId)) {
-                            channels += Channel(
-                                sourceId = sourceId,
-                                streamId = streamId,
-                                name = name,
-                                categoryId = attributes["group-title"]?.takeIf { it.isNotBlank() },
-                                logoUrl = (attributes["tvg-logo"] ?: attributes["logo"])
-                                    ?.takeIf { it.isNotBlank() },
-                                epgChannelId = attributes["tvg-id"]?.takeIf { it.isNotBlank() },
-                                number = pendingNumber,
-                                streamUrl = line,
-                                sortIndex = index++,
+                            ?.let { "xui:$it" }
+                            ?: "url:${java.lang.Long.toHexString(fnv64(line))}"
+                        // A repeated xui-id (or the same url) keeps the first. A 64-bit hash
+                        // stands in for the id so the set stays a few megabytes.
+                        if (seen.add(fnv64(streamId))) {
+                            val group = pendingGroup?.takeIf { it.isNotBlank() }
+                            if (group != null) categories.add(group)
+                            onChannel(
+                                normalizedChannel(
+                                    sourceId = sourceId,
+                                    streamId = streamId,
+                                    name = name,
+                                    categoryId = group,
+                                    logoUrl = pendingLogo?.takeIf { it.isNotBlank() },
+                                    epgChannelId = pendingTvgId?.takeIf { it.isNotBlank() },
+                                    number = pendingNumber,
+                                    streamUrl = line,
+                                    sortIndex = index++,
+                                ),
                             )
                         }
                     }
                     pendingName = null
-                    pendingAttributes = emptyMap()
+                    pendingTvgId = null
+                    pendingTvgName = null
+                    pendingLogo = null
+                    pendingGroup = null
                     pendingNumber = null
+                    pendingXui = null
                 }
             }
         }
 
-        return Result(channels, declaredEpgUrl, skipped)
+        return Header(declaredEpgUrl, skipped, categories.toList())
     }
 
     /**
@@ -114,24 +139,88 @@ object M3uParser {
      * to `tvg-name` matters because a fair number of playlists emit `#EXTINF:-1 ...,` with
      * nothing after the comma.
      */
-    private fun displayNameOf(line: String, attributes: Map<String, String>): String? {
+    private fun displayNameOf(line: String, tvgName: String?): String? {
         val afterComma = line.substringAfterLast(',', missingDelimiterValue = "").trim()
         return afterComma.takeIf { it.isNotBlank() }
-            ?: attributes["tvg-name"]?.takeIf { it.isNotBlank() }
+            ?: tvgName?.takeIf { it.isNotBlank() }
     }
 
-    private fun parseAttributes(line: String): Map<String, String> =
-        ATTRIBUTE_REGEX.findAll(line).associate { match ->
-            match.groupValues[1].lowercase() to match.groupValues[2]
+    /**
+     * One quoted attribute, matched by name. `logo` does not match the tail of `tvg-logo`:
+     * the name has to start at the beginning of the line or after whitespace.
+     */
+    private fun attribute(line: String, key: String): String? {
+        val needle = "$key=\""
+        var from = 0
+        while (from < line.length) {
+            val start = line.indexOf(needle, from, ignoreCase = true)
+            if (start < 0) return null
+            val boundary = start == 0 || line[start - 1] == ' ' || line[start - 1] == '\t'
+            if (boundary) {
+                val valueStart = start + needle.length
+                val end = line.indexOf('"', valueStart)
+                if (end < 0) return null
+                return line.substring(valueStart, end)
+            }
+            from = start + 1
         }
-
-    /** FNV-1a. Stable across processes and platforms, unlike [String.hashCode] guarantees. */
-    private fun stableHash(value: String): String {
-        var hash = 0xcbf29ce484222325uL.toLong() // FNV-1a 64-bit offset basis
-        for (byte in value.encodeToByteArray()) {
-            hash = hash xor (byte.toLong() and 0xff)
-            hash *= 0x100000001b3L // FNV-1a 64-bit prime
-        }
-        return java.lang.Long.toHexString(hash)
+        return null
     }
+}
+
+/** FNV-1a 64-bit. Stable across processes, unlike [String.hashCode]. */
+internal fun fnv64(value: String): Long {
+    var hash = 0xcbf29ce484222325uL.toLong()
+    for (byte in value.encodeToByteArray()) {
+        hash = hash xor (byte.toLong() and 0xff)
+        hash *= 0x100000001b3L
+    }
+    return hash
+}
+
+/** Decorative list headings: starts AND ends with a run of banner characters. */
+internal fun isSeparatorRow(rawName: String): Boolean {
+    val trimmed = rawName.trim()
+    if (trimmed.length < 6) return false
+    return trimmed.take(3).all { it in SEPARATOR_MARKS } &&
+        trimmed.takeLast(3).all { it in SEPARATOR_MARKS }
+}
+
+private val SEPARATOR_MARKS = charArrayOf('#', '*', '=', '~', '-', '_', '•', '█', '▓', '|')
+
+private fun normalizedChannel(
+    sourceId: Long,
+    streamId: String,
+    name: String,
+    categoryId: String?,
+    logoUrl: String?,
+    epgChannelId: String?,
+    number: Int?,
+    streamUrl: String,
+    sortIndex: Int,
+): Channel {
+    val normalized = ChannelNameNormalizer.normalize(name)
+    var rank = normalized.qualityRank
+    var label = normalized.qualityLabel
+    if ((label.isEmpty() || rank == 0) && categoryId != null) {
+        val fromCategory = ChannelNameNormalizer.normalize(categoryId)
+        if (label.isEmpty()) label = fromCategory.qualityLabel
+        if (rank == 0) rank = fromCategory.qualityRank
+    }
+    return Channel(
+        sourceId = sourceId,
+        streamId = streamId,
+        name = name,
+        displayName = normalized.baseName,
+        groupKey = normalized.groupKey,
+        qualityRank = rank,
+        qualityLabel = label,
+        categoryId = categoryId,
+        logoUrl = logoUrl,
+        epgChannelId = epgChannelId,
+        number = number,
+        streamUrl = streamUrl,
+        sortIndex = sortIndex,
+        hidden = isSeparatorRow(name),
+    )
 }

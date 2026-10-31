@@ -6,6 +6,11 @@
 package app.opentv.data.repo
 
 import android.util.Log
+import app.opentv.core.AppSettings
+import app.opentv.core.CountingInputStream
+import app.opentv.core.LoadMeter
+import app.opentv.core.LoadStep
+import app.opentv.core.LoadTrace
 import app.opentv.data.db.ChannelDao
 import app.opentv.data.db.EpgChannelAliasDao
 import app.opentv.data.db.EpgFeedDao
@@ -13,8 +18,10 @@ import app.opentv.data.db.ProgrammeDao
 import app.opentv.data.db.SourceDao
 import app.opentv.data.model.EpgChannelAlias
 import app.opentv.data.model.EpgFeed
+import app.opentv.data.model.GuideSlot
 import app.opentv.data.model.Programme
 import app.opentv.data.model.Source
+import app.opentv.data.model.SourceKind
 import app.opentv.data.parser.ChannelNameNormalizer
 import app.opentv.data.parser.XmltvParser
 import app.opentv.data.remote.XtreamApi
@@ -63,6 +70,7 @@ class EpgRepository(
     private val sourceDao: SourceDao,
     private val api: XtreamApi,
     private val http: OkHttpClient,
+    private val settings: AppSettings,
 ) {
 
     data class SyncSummary(
@@ -79,6 +87,51 @@ class EpgRepository(
 
     fun observeWindow(fromUtcMillis: Long, toUtcMillis: Long): Flow<List<Programme>> =
         programmeDao.observeWindow(fromUtcMillis, toUtcMillis)
+
+    /** Guide index: title and times only. See [ProgrammeDao.observeGuideWindow]. */
+    fun observeGuideWindow(fromUtcMillis: Long, toUtcMillis: Long): Flow<List<GuideSlot>> =
+        programmeDao.observeGuideWindow(fromUtcMillis, toUtcMillis)
+
+    /** Row count of the guide table. Debounce it: a sync writes in batches and each one emits. */
+    fun observeProgrammeCount(): Flow<Int> = programmeDao.observeCount()
+
+    /**
+     * Reads the guide window in id batches of [GUIDE_ID_CHUNK]. Each batch is handed to [onChunk]
+     * and then dropped — the repository never holds the whole window.
+     *
+     * [onChunk] runs on the caller dispatcher, after the query, so a flow can emit between batches.
+     * Empty [epgChannelIds] does nothing. Duplicate ids are queried once.
+     */
+    suspend fun forEachGuideChunk(
+        fromUtcMillis: Long,
+        toUtcMillis: Long,
+        epgChannelIds: Collection<String>,
+        onChunk: suspend (slots: List<GuideSlot>, index: Int, count: Int) -> Unit,
+    ) {
+        if (epgChannelIds.isEmpty()) return
+        val batches = ArrayList<List<String>>()
+        val seen = HashSet<String>()
+        val batch = ArrayList<String>(GUIDE_ID_CHUNK)
+        for (id in epgChannelIds) {
+            if (!seen.add(id)) continue
+            batch.add(id)
+            if (batch.size == GUIDE_ID_CHUNK) {
+                batches.add(batch.toList())
+                batch.clear()
+            }
+        }
+        if (batch.isNotEmpty()) batches.add(batch.toList())
+        val count = batches.size
+        for ((index, ids) in batches.withIndex()) {
+            val slots = withContext(Dispatchers.IO) {
+                programmeDao.guideSlotsFor(fromUtcMillis, toUtcMillis, ids)
+            }
+            onChunk(slots, index, count)
+        }
+    }
+
+    /** One full programme, description included, for a record or reminder dialog. */
+    suspend fun programme(id: Long): Programme? = programmeDao.byId(id)
 
     fun observeNow(nowUtcMillis: Long): Flow<List<Programme>> =
         programmeDao.observeNow(nowUtcMillis)
@@ -134,61 +187,114 @@ class EpgRepository(
 
     // ---- Sync ------------------------------------------------------------------------------
 
-    /** Downloads every enabled feed, merges, prunes, and re-runs the matcher. */
-    suspend fun syncAll(nowUtcMillis: Long, force: Boolean = false): SyncSummary =
-        withContext(Dispatchers.IO) {
-            ensureFeeds()
-            maybeAutoEnableRegionalFeed()
-
-            var succeeded = 0
-            var failed = 0
-            var written = 0
-
-            for (feed in feedDao.enabled()) {
-                if (!force && nowUtcMillis - feed.lastSyncMillis < REFRESH_INTERVAL_MILLIS) {
-                    succeeded++
-                    continue
-                }
-                when (val result = syncFeed(feed, nowUtcMillis)) {
-                    is FeedResult.Success -> {
-                        succeeded++
-                        written += result.programmes
-                        feedDao.markSynced(
-                            feed.id,
-                            nowUtcMillis,
-                            "${result.programmes} programmes, ${result.channels} channels",
-                        )
-                    }
-                    is FeedResult.Failed -> {
-                        failed++
-                        // The stamp is NOT advanced on failure, so the next sync retries
-                        // rather than waiting out the interval on a feed that never landed.
-                        feedDao.markSynced(feed.id, feed.lastSyncMillis, result.reason)
-                        Log.w(TAG, "Feed '${feed.name}' failed: ${result.reason}")
-                    }
-                }
-            }
-
-            if (succeeded > 0) {
-                programmeDao.deleteEndedBefore(nowUtcMillis - RETENTION_PAST_MILLIS)
-            }
-
-            val (matched, total) = runMatcher()
-            SyncSummary(succeeded, failed, written, matched, total)
+    /**
+     * Adds the guide downloads that will actually run to [meter], using each feed's
+     * `Content-Length` or the size remembered from last time.
+     */
+    suspend fun plan(meter: LoadMeter, nowUtcMillis: Long, force: Boolean) {
+        ensureFeeds()
+        var total = 0L
+        val due = ArrayList<EpgFeed>()
+        for (feed in feedDao.enabled()) {
+            if (!acceptsGuideDownload(feed)) continue
+            if (!force && nowUtcMillis - feed.lastSyncMillis < REFRESH_INTERVAL_MILLIS) continue
+            due += feed
+            val len = probeFeed(feed)
+            if (len > 0) total += len
         }
+        if (due.isNotEmpty()) meter.plan(LoadStep.GUIDE, if (total > 0) total else -1L)
+    }
+
+    /** Downloads every enabled feed, merges, prunes, and re-runs the matcher. */
+    suspend fun syncAll(
+        nowUtcMillis: Long,
+        force: Boolean = false,
+        meter: LoadMeter? = null,
+    ): SyncSummary = withContext(Dispatchers.IO) {
+        ensureFeeds()
+        maybeAutoEnableRegionalFeed()
+
+        var succeeded = 0
+        var failed = 0
+        var written = 0
+        val enabled = ArrayList<EpgFeed>()
+        for (feed in feedDao.enabled()) {
+            if (acceptsGuideDownload(feed)) enabled += feed
+        }
+        val due = enabled.filter { feed ->
+            force || nowUtcMillis - feed.lastSyncMillis >= REFRESH_INTERVAL_MILLIS
+        }
+        if (due.isNotEmpty()) meter?.begin(LoadStep.GUIDE, -1L)
+        var baseBytes = 0L
+
+        for (feed in enabled) {
+            if (!force && nowUtcMillis - feed.lastSyncMillis < REFRESH_INTERVAL_MILLIS) {
+                succeeded++
+                continue
+            }
+            var feedBytes = 0L
+            when (
+                val result = syncFeed(
+                    feed,
+                    nowUtcMillis,
+                    onBytes = { read ->
+                        feedBytes = read
+                        meter?.setBytes(baseBytes + read)
+                    },
+                    onProgrammes = { count -> meter?.setItems(written + count) },
+                )
+            ) {
+                is FeedResult.Success -> {
+                    succeeded++
+                    written += result.programmes
+                    meter?.setItems(written)
+                    feedDao.markSynced(
+                        feed.id,
+                        nowUtcMillis,
+                        "${result.programmes} programmes, ${result.channels} channels",
+                    )
+                }
+                is FeedResult.Failed -> {
+                    failed++
+                    feedDao.markSynced(feed.id, feed.lastSyncMillis, result.reason)
+                    Log.w(TAG, "Feed '${feed.name}' failed: ${result.reason}")
+                }
+            }
+            if (feedBytes > 0) settings.saveFeedBytes(feed.id, feedBytes)
+            baseBytes += feedBytes
+        }
+
+        if (due.isNotEmpty()) {
+            val remembered = meter?.endStep(written) ?: 0L
+            if (remembered > 0 && due.size == 1) settings.saveFeedBytes(due.single().id, remembered)
+        }
+
+        if (succeeded > 0) {
+            programmeDao.deleteEndedBefore(nowUtcMillis - RETENTION_PAST_MILLIS)
+        }
+
+        val (matched, total) = runMatcher(meter)
+        SyncSummary(succeeded, failed, written, matched, total)
+    }
 
     private sealed interface FeedResult {
         data class Success(val programmes: Int, val channels: Int) : FeedResult
         data class Failed(val reason: String) : FeedResult
     }
 
-    private suspend fun syncFeed(feed: EpgFeed, nowUtcMillis: Long): FeedResult {
+    private suspend fun syncFeed(
+        feed: EpgFeed,
+        nowUtcMillis: Long,
+        onBytes: (Long) -> Unit = {},
+        onProgrammes: (Int) -> Unit = {},
+    ): FeedResult {
         val batch = ArrayList<Programme>(BATCH_SIZE)
         val aliases = ArrayList<EpgChannelAlias>(256)
         var written = 0
 
         try {
-            openFeedStream(feed).use { stream ->
+            val opened = openFeedStream(feed, onBytes)
+            opened.stream.use { stream ->
                 val stats = XmltvParser.parse(
                     input = stream,
                     feedId = feed.id,
@@ -201,14 +307,13 @@ class EpgRepository(
                         )
                     },
                     onProgramme = { programme ->
-                        // Skip anything that finished before the retention cut-off; no point
-                        // writing rows we are about to prune.
                         if (programme.endUtcMillis >= nowUtcMillis - RETENTION_PAST_MILLIS) {
                             batch += programme
                             if (batch.size >= BATCH_SIZE) {
                                 programmeDao.upsertAll(batch)
                                 written += batch.size
                                 batch.clear()
+                                onProgrammes(written)
                             }
                         }
                     },
@@ -216,6 +321,7 @@ class EpgRepository(
                 if (batch.isNotEmpty()) {
                     programmeDao.upsertAll(batch)
                     written += batch.size
+                    onProgrammes(written)
                 }
                 if (aliases.isNotEmpty()) {
                     aliases.chunked(BATCH_SIZE).forEach { aliasDao.upsertAll(it) }
@@ -229,26 +335,23 @@ class EpgRepository(
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
-            // Deliberately no cleanup. Whatever was written is newer than what was there,
-            // and what was there is still there.
             return FeedResult.Failed(e.message ?: "Download failed.")
         }
     }
 
+    private class OpenedFeed(val stream: InputStream)
+
     /**
-     * Opens a feed as a decompressed XML stream.
-     *
-     * Several of the free guide sources publish `.gz` files (a national guide compresses
-     * roughly 10:1), and providers occasionally gzip xmltv.php without saying so. Sniffing
-     * the first two bytes for the gzip magic number handles both, regardless of what the
-     * URL or the headers claim.
+     * Opens a feed as a decompressed XML stream. Bytes reported to [onBytes] are the HTTP body,
+     * counted before gzip inflation, so they line up with `Content-Length`.
      */
-    private suspend fun openFeedStream(feed: EpgFeed): InputStream {
-        val raw: InputStream = when {
+    private suspend fun openFeedStream(feed: EpgFeed, onBytes: (Long) -> Unit): OpenedFeed {
+        val raw: InputStream
+        when {
             feed.providerSourceId != null -> {
                 val source: Source = sourceDao.byId(feed.providerSourceId)
                     ?: throw IllegalStateException("Provider for this guide no longer exists.")
-                api.openEpgStream(source)
+                raw = api.openEpgStream(source).stream
             }
             feed.url != null -> {
                 val response = http.newCall(Request.Builder().url(feed.url).build()).execute()
@@ -256,18 +359,61 @@ class EpgRepository(
                     response.close()
                     throw IllegalStateException("Guide download failed (HTTP ${response.code}).")
                 }
-                response.body?.byteStream()
+                val body = response.body
                     ?: throw IllegalStateException("The server returned an empty guide.")
+                raw = body.byteStream()
             }
             else -> throw IllegalStateException("Feed has no URL and no provider.")
         }
 
-        val buffered = BufferedInputStream(raw, 8 * 1024)
+        val counting = CountingInputStream(raw, onBytes)
+        val buffered = BufferedInputStream(counting, 8 * 1024)
         buffered.mark(2)
         val b1 = buffered.read()
         val b2 = buffered.read()
         buffered.reset()
-        return if (b1 == 0x1f && b2 == 0x8b) GZIPInputStream(buffered) else buffered
+        val decoded = if (b1 == 0x1f && b2 == 0x8b) GZIPInputStream(buffered) else buffered
+        return OpenedFeed(decoded)
+    }
+
+    /**
+     * An M3U playlist with no `url-tvg` and no EPG URL the user typed has no guide. Do not
+     * invent `/xmltv.php` with an empty username and password — that request is not this list.
+     */
+    private suspend fun acceptsGuideDownload(feed: EpgFeed): Boolean {
+        val sourceId = feed.providerSourceId ?: return !feed.url.isNullOrBlank()
+        val source = sourceDao.byId(sourceId) ?: return false
+        if (source.kind == SourceKind.M3U && source.epgUrl.isNullOrBlank()) return false
+        return true
+    }
+
+    private suspend fun probeFeed(feed: EpgFeed): Long {
+        val remembered = settings.feedBytes(feed.id)
+        val url = when {
+            !feed.url.isNullOrBlank() -> feed.url
+            feed.providerSourceId != null -> {
+                val source = sourceDao.byId(feed.providerSourceId) ?: return remembered
+                api.guideUrl(source).toString()
+            }
+            else -> return remembered
+        }
+        val probed = probeLength(url)
+        return if (probed > 0) probed else remembered
+    }
+
+    private fun probeLength(url: String): Long {
+        return try {
+            val request = Request.Builder().url(url).head().build()
+            http.newCall(request).execute().use { response ->
+                response.body?.close()
+                if (response.code == 405 || response.code == 501) return -1L
+                response.header("Content-Length")?.toLongOrNull() ?: -1L
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            -1L
+        }
     }
 
     // ---- Matching --------------------------------------------------------------------------
@@ -276,32 +422,40 @@ class EpgRepository(
      * Joins every channel to the merged guide by normalised name.
      * Returns (channels with a working guide id, total channels).
      */
-    suspend fun runMatcher(): Pair<Int, Int> {
+    suspend fun runMatcher(meter: LoadMeter? = null): Pair<Int, Int> {
         val aliases = aliasDao.all()
         val index = EpgMatcher.buildIndex(aliases.map { it.epgId to it.displayName })
-        // Only ids that actually have programmes count as "working" — a match against a
-        // channel the guide lists but never fills is a guide that looks broken.
         val populated = programmeDao.channelIdsWithProgrammes().toHashSet()
+        val total = channelDao.countAll()
+        meter?.beginCounted(LoadStep.MATCH, total)
 
-        val channels = channelDao.allForMatching()
+        var afterId = 0L
         var matched = 0
-
-        for (channel in channels) {
-            val newMatch = index.match(channel.groupKey)
-            if (newMatch != channel.matchedEpgId) {
-                channelDao.setMatchedEpgId(channel.id, newMatch)
+        var seen = 0
+        while (true) {
+            val channels = channelDao.pageAfterId(afterId, MATCH_PAGE)
+            if (channels.isEmpty()) break
+            afterId = channels.last().id
+            for (channel in channels) {
+                val newMatch = index.match(channel.groupKey)
+                if (newMatch != channel.matchedEpgId) {
+                    channelDao.setMatchedEpgId(channel.id, newMatch)
+                }
+                val works = channel.epgCandidates.any { it in populated } ||
+                    (newMatch != null && newMatch in populated)
+                if (works) matched++
             }
-            val works = channel.epgCandidates.any { it in populated } ||
-                (newMatch != null && newMatch in populated)
-            if (works) matched++
+            seen += channels.size
+            meter?.setKnownTotal(seen, total)
         }
+        meter?.endStep(seen)
 
         Log.i(
             TAG,
-            "Matcher: $matched of ${channels.size} channels have a working guide " +
+            "Matcher: $matched of $total channels have a working guide " +
                 "(${aliases.size} guide aliases, ${populated.size} populated guide channels)",
         )
-        return matched to channels.size
+        return matched to total
     }
 
     suspend fun setManualOverride(channelId: Long, epgId: String?) =
@@ -328,9 +482,15 @@ class EpgRepository(
         if (!pristine) return
 
         val regionCounts = HashMap<String, Int>()
-        for (channel in channelDao.allForMatching()) {
-            val region = ChannelNameNormalizer.normalize(channel.name).region ?: continue
-            regionCounts.merge(region, 1, Int::plus)
+        var afterId = 0L
+        while (true) {
+            val page = channelDao.pageAfterId(afterId, MATCH_PAGE)
+            if (page.isEmpty()) break
+            afterId = page.last().id
+            for (channel in page) {
+                val region = ChannelNameNormalizer.normalize(channel.name).region ?: continue
+                regionCounts.merge(region, 1, Int::plus)
+            }
         }
         val top = regionCounts.maxByOrNull { it.value } ?: return
         if (top.value < MIN_CHANNELS_FOR_AUTO_REGION) return
@@ -346,6 +506,15 @@ class EpgRepository(
 
         /** Writes per transaction. Large enough to be fast, small enough not to hold WAL open. */
         const val BATCH_SIZE = 500
+
+        /** Channels per page when matching or scanning the table. Cursor is the row id. */
+        private const val MATCH_PAGE = 500
+
+        /**
+         * EPG channel ids per [forEachGuideChunk] query. SQLite caps bound variables at 999 on
+         * API 23; 400 leaves room for the two time parameters.
+         */
+        const val GUIDE_ID_CHUNK = 400
 
         /** Keep finished programmes for a day so "what was on" still works. */
         val RETENTION_PAST_MILLIS: Long = TimeUnit.DAYS.toMillis(1)

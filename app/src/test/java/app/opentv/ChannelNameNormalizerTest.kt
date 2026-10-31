@@ -115,6 +115,23 @@ class ChannelNameNormalizerTest {
     }
 
     @Test
+    fun `brazilian state prefixes stay in the name and the group key`() {
+        val sp = ChannelNameNormalizer.normalize("SP - Globo")
+        val rj = ChannelNameNormalizer.normalize("RJ - Globo HD")
+        val uk = ChannelNameNormalizer.normalize("UK| BBC ONE FHD")
+
+        assertThat(sp.baseName).isEqualTo("SP Globo")
+        assertThat(sp.groupKey).isEqualTo("spglobo")
+        assertThat(sp.region).isNull()
+        assertThat(rj.baseName).isEqualTo("RJ Globo")
+        assertThat(rj.groupKey).isEqualTo("rjglobo")
+        assertThat(rj.qualityLabel).isEqualTo("HD")
+        assertThat(sp.groupKey).isNotEqualTo(rj.groupKey)
+        assertThat(uk.baseName).isEqualTo("BBC ONE")
+        assertThat(uk.groupKey).isEqualTo("bbc1")
+    }
+
+    @Test
     fun `group keys ignore case punctuation and spacing`() {
         val keys = listOf("BBC One", "bbc-one", "B B C ONE", "BbcOne")
             .map { ChannelNameNormalizer.groupKeyOf(it) }

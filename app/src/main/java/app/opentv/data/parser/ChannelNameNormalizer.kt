@@ -94,6 +94,9 @@ object ChannelNameNormalizer {
         """^\s*(?:[\[(]([A-Z]{2,3})[\])]\s*[|:\-–—]?|([A-Z]{2,3})\s*[|:\-–—])\s*"""
     )
 
+    /** Prefixes worth stripping. Anything else (`SP`, `RJ`, `MG`) stays in the name. */
+    private val COUNTRY_CODES = setOf("UK", "GB", "US", "USA", "CA", "AU", "AUS")
+
     /**
      * Decorations providers use as separators or eye-catchers — stripped from the display
      * name. Broad on purpose: anything outside letters, digits, spaces and the handful of
@@ -137,8 +140,13 @@ object ChannelNameNormalizer {
         // delimiter, and the decoration pass would eat them and lose the tag.
         var region: String? = null
         COUNTRY_PREFIX.find(working)?.let { match ->
-            region = match.groupValues[1].ifEmpty { match.groupValues[2] }
-            working = working.removeRange(match.range)
+            val code = match.groupValues[1].ifEmpty { match.groupValues[2] }
+            // Only a country the guide knows. A Brazilian state code (`SP - Globo`,
+            // `RJ - Globo`) is part of the channel, not a country tag to throw away.
+            if (code in COUNTRY_CODES) {
+                region = code
+                working = working.removeRange(match.range)
+            }
         }
 
         working = DECORATION.replace(working, " ")

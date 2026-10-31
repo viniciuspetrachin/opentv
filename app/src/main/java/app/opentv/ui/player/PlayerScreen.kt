@@ -106,6 +106,7 @@ import app.opentv.player.PlaybackQueue
 import app.opentv.player.PlayerController
 import app.opentv.ui.RecordingBackgroundDialog
 import app.opentv.ui.RecordingBackgroundPrompt
+import app.opentv.ui.rememberSizedImage
 import coil.compose.AsyncImage
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -144,7 +145,10 @@ fun PlayerScreen(
             context, scope, graph.streamingHttpClient,
             subtitlesEnabled = settings.subtitlesEnabled.value,
             // Opt-in shallow DVR so the transport's pause/rewind actually holds on a live stream.
-            dvr = settings.livePauseEnabled.value,
+            // LITE ignores it: a 120 s back-buffer is the opposite of what a 1 GB stick can spare.
+            // The preference stays saved for when LITE is turned off.
+            dvr = settings.livePauseEnabled.value && !settings.liteMode.value,
+            lite = settings.liteMode.value,
         )
     }
     val state by controller.state.collectAsState()
@@ -685,7 +689,7 @@ private fun ChannelListRow(
             modifier = Modifier.width(40.dp),
         )
         AsyncImage(
-            model = item.logoUrl,
+            model = rememberSizedImage(item.logoUrl, 32.dp, 32.dp),
             contentDescription = null,
             modifier = Modifier.size(32.dp).clip(RoundedCornerShape(4.dp)),
         )

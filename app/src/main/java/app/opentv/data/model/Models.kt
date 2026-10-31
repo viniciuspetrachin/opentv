@@ -256,6 +256,44 @@ data class Programme(
     }
 }
 
+/**
+ * The slice of a [Programme] the guide keeps for every channel in the 24-hour window.
+ *
+ * Descriptions, categories and icons stay in SQLite. Holding them for thousands of channels is
+ * what blows the heap on a 1 GB stick; the grid only paints a title and a time. The full row is
+ * loaded by [id] when the user actually records or sets a reminder.
+ *
+ * Not an entity — Room maps the guide query straight onto this constructor. The query orders by
+ * channel then start, so each channel's list is already start-ordered and can be shared as-is.
+ */
+data class GuideSlot(
+    val id: Long,
+    val epgChannelId: String,
+    val startUtcMillis: Long,
+    val endUtcMillis: Long,
+    val title: String,
+) {
+    val durationMillis: Long get() = endUtcMillis - startUtcMillis
+
+    fun isLiveAt(nowUtcMillis: Long): Boolean =
+        nowUtcMillis in startUtcMillis until endUtcMillis
+
+    fun progressAt(nowUtcMillis: Long): Float {
+        if (durationMillis <= 0L) return 0f
+        return ((nowUtcMillis - startUtcMillis).toFloat() / durationMillis).coerceIn(0f, 1f)
+    }
+
+    /** A programme shell for a booking when the full row could not be read. Description stays null. */
+    fun asProgramme(): Programme = Programme(
+        id = id,
+        feedId = 0,
+        epgChannelId = epgChannelId,
+        startUtcMillis = startUtcMillis,
+        endUtcMillis = endUtcMillis,
+        title = title,
+    )
+}
+
 @Entity(
     tableName = "movies",
     indices = [
@@ -278,6 +316,8 @@ data class Movie(
     val streamUrl: String,
     val favourite: Boolean = false,
     val addedMillis: Long = 0,
+    /** Stamp of the last catalogue sync that saw this movie. See [Channel.lastSeenMillis]. */
+    @ColumnInfo(defaultValue = "0") val lastSeenMillis: Long = 0,
     /**
      * Richer metadata for the Netflix-style detail/home surfaces, pulled from the provider's own
      * Xtream `get_vod_info`. All nullable and best-effort: a panel that omits them just yields a
@@ -314,6 +354,8 @@ data class Series(
     val plot: String?,
     val favourite: Boolean = false,
     val addedMillis: Long = 0,
+    /** Stamp of the last catalogue sync that saw this series. See [Channel.lastSeenMillis]. */
+    @ColumnInfo(defaultValue = "0") val lastSeenMillis: Long = 0,
     /**
      * Richer metadata for the Netflix-style detail/home surfaces, from the provider's own Xtream
      * `get_series_info`. Nullable and best-effort. Series carry no `director` (episodes vary), so

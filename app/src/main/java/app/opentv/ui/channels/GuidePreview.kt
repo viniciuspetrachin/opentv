@@ -36,10 +36,16 @@ import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -47,11 +53,13 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.media3.common.util.UnstableApi
 import app.opentv.R
+import app.opentv.core.ServiceLocator
 import app.opentv.data.model.shownName
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.PlayerView
 import app.opentv.ui.ChannelsViewModel
+import app.opentv.ui.rememberSizedImage
 import coil.compose.AsyncImage
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -92,6 +100,15 @@ fun GuidePreview(
     onNextDay: () -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
+    // One row, for the channel you're on — not the whole guide. The synopsis stays, the heap doesn't.
+    val context = LocalContext.current
+    val nowId = row?.now?.id
+    var synopsis by remember(nowId) { mutableStateOf<String?>(null) }
+    LaunchedEffect(nowId) {
+        synopsis = nowId?.let { id ->
+            ServiceLocator.get(context).epgRepository.programme(id)?.description?.takeIf { it.isNotBlank() }
+        }
+    }
     Row(
         modifier
             .fillMaxWidth()
@@ -111,7 +128,7 @@ fun GuidePreview(
             // Logo sits behind everything as the fallback / shutter.
             if (row != null) {
                 AsyncImage(
-                    model = row.primary.logoUrl,
+                    model = rememberSizedImage(row.primary.logoUrl, 200.dp, 113.dp),
                     contentDescription = null,
                     modifier = Modifier.fillMaxSize(0.6f),
                 )
@@ -253,10 +270,10 @@ fun GuidePreview(
                     progress = { nowProg.progressAt(nowMillis) },
                     modifier = Modifier.fillMaxWidth().height(4.dp).clip(RoundedCornerShape(2.dp)),
                 )
-                nowProg.description?.takeIf { it.isNotBlank() }?.let { synopsis ->
+                synopsis?.let { text ->
                     Spacer(Modifier.height(8.dp))
                     Text(
-                        synopsis,
+                        text,
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         maxLines = 2,

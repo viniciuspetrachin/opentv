@@ -52,6 +52,7 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -63,6 +64,7 @@ import app.opentv.data.model.Series
 import app.opentv.data.model.StremioStream
 import app.opentv.data.parser.displayTitle
 import app.opentv.ui.VodViewModel
+import app.opentv.ui.rememberSizedImage
 import coil.compose.AsyncImage
 import androidx.compose.ui.window.Dialog
 import kotlinx.coroutines.delay
@@ -382,9 +384,10 @@ private fun DetailBackdrop(
         // error callback rather than trusting a non-null URL to actually resolve.
         val bgCandidates = remember(backdropUrl, posterUrl) { listOfNotNull(backdropUrl, posterUrl).distinct() }
         var bgIndex by remember(bgCandidates) { mutableStateOf(0) }
-        bgCandidates.getOrNull(bgIndex)?.let { model ->
+        val screenWidth = LocalConfiguration.current.screenWidthDp.dp
+        bgCandidates.getOrNull(bgIndex)?.let { art ->
             AsyncImage(
-                model = model,
+                model = rememberSizedImage(art, screenWidth, 360.dp),
                 contentDescription = null,
                 contentScale = ContentScale.Crop,
                 modifier = Modifier.matchParentSize(),
@@ -454,7 +457,7 @@ private fun HeroPosterCard(posterUrl: String?, title: String) {
     ) {
         if (posterUrl != null && !posterFailed) {
             AsyncImage(
-                model = posterUrl,
+                model = rememberSizedImage(posterUrl, 128.dp, 192.dp),
                 contentDescription = title,
                 contentScale = ContentScale.Crop,
                 modifier = Modifier.matchParentSize(),

@@ -191,6 +191,27 @@ class AppSettings private constructor(context: Context) {
         _livePauseEnabled.value = enabled
     }
 
+    /**
+     * Tight memory profile for a 1 GB stick. While on, the guide does not open a second video
+     * decoder and playback keeps a short buffer. The preview and live-pause preferences are left
+     * stored, so turning LITE off restores them. On a first launch with no saved value, a Fire TV
+     * or a box with about 1.5 GB or less starts here.
+     */
+    private val _liteMode = MutableStateFlow(readLiteMode(context))
+    val liteMode: StateFlow<Boolean> = _liteMode.asStateFlow()
+
+    fun setLiteMode(enabled: Boolean) {
+        prefs.edit().putBoolean(KEY_LITE, enabled).apply()
+        _liteMode.value = enabled
+    }
+
+    private fun readLiteMode(context: Context): Boolean {
+        if (prefs.contains(KEY_LITE)) return prefs.getBoolean(KEY_LITE, false)
+        val lite = MemoryGovernor.shouldDefaultLite(context)
+        prefs.edit().putBoolean(KEY_LITE, lite).apply()
+        return lite
+    }
+
     // ---- Content types -----------------------------------------------------------------------
 
     /**
@@ -377,6 +398,23 @@ class AppSettings private constructor(context: Context) {
         get() = prefs.getLong(KEY_VOD_SYNCED_AT, 0L)
         set(value) { prefs.edit().putLong(KEY_VOD_SYNCED_AT, value).apply() }
 
+    /** Byte size of the last successful download of [step] for [sourceId], or -1 if unknown. */
+    fun loadBytes(sourceId: Long, step: String): Long =
+        prefs.getLong(loadBytesKey(sourceId, step), -1L)
+
+    fun saveLoadBytes(sourceId: Long, step: String, bytes: Long) {
+        if (bytes > 0) prefs.edit().putLong(loadBytesKey(sourceId, step), bytes).apply()
+    }
+
+    /** Byte size of the last successful download of guide feed [feedId], or -1. */
+    fun feedBytes(feedId: Long): Long = prefs.getLong("load_bytes_feed_$feedId", -1L)
+
+    fun saveFeedBytes(feedId: Long, bytes: Long) {
+        if (bytes > 0) prefs.edit().putLong("load_bytes_feed_$feedId", bytes).apply()
+    }
+
+    private fun loadBytesKey(sourceId: Long, step: String) = "load_bytes_${sourceId}_$step"
+
     /**
      * The user's own TMDB API key (v3 auth), stored on-device only exactly like provider
      * credentials, used to fill in artwork/metadata a provider left blank. Blank = the TMDB
@@ -461,6 +499,7 @@ class AppSettings private constructor(context: Context) {
         private const val KEY_PAD_END = "rec_pad_end_min"
         private const val KEY_REC_AUTOSWITCH = "rec_auto_switch"
         private const val KEY_LIVE_PAUSE = "live_pause_enabled"
+        private const val KEY_LITE = "lite_mode"
 
         @Volatile private var instance: AppSettings? = null
 

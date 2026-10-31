@@ -45,6 +45,7 @@ import android.content.Context
 import android.widget.Toast
 import app.opentv.R
 import app.opentv.core.AppSettings
+import app.opentv.core.MemoryGovernor
 import app.opentv.core.SleepTimer
 import app.opentv.core.findActivity
 import app.opentv.data.work.SyncWorker
@@ -61,6 +62,8 @@ fun AppSettingsScreen(onBack: () -> Unit) {
     val themeMode by settings.themeMode.collectAsState()
     val channelLayout by settings.channelLayout.collectAsState()
     val previewVideo by settings.guidePreviewVideo.collectAsState()
+    val liteMode by settings.liteMode.collectAsState()
+    val memory by remember { MemoryGovernor.get(context) }.snapshot.collectAsState()
     val previewSound by settings.guidePreviewSound.collectAsState()
     val captions by settings.subtitlesEnabled.collectAsState()
     val resumeLast by settings.resumeLastChannel.collectAsState()
@@ -91,6 +94,26 @@ fun AppSettingsScreen(onBack: () -> Unit) {
         }
 
         Spacer(Modifier.height(20.dp))
+
+        SettingsSection(stringResource(R.string.settings_section_performance)) {
+            ToggleRow(
+                title = stringResource(R.string.settings_lite_title),
+                subtitle = stringResource(R.string.settings_lite_subtitle),
+                checked = liteMode,
+                onToggle = settings::setLiteMode,
+            )
+            val freeMb = (memory.availBytes / (1024 * 1024)).toInt()
+            val cacheMb = remember(memory) {
+                (coil.Coil.imageLoader(context).memoryCache?.size ?: 0) / (1024 * 1024)
+            }
+            Text(
+                stringResource(R.string.settings_lite_memory, freeMb, cacheMb),
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+
+        Spacer(Modifier.height(16.dp))
 
         SettingsSection(stringResource(R.string.settings_appearance)) {
             ThemeOption(stringResource(R.string.settings_theme_system), themeMode == AppSettings.ThemeMode.SYSTEM) {
@@ -178,8 +201,10 @@ fun AppSettingsScreen(onBack: () -> Unit) {
             Spacer(Modifier.height(8.dp))
             ToggleRow(
                 title = stringResource(R.string.settings_live_preview_title),
-                subtitle = stringResource(R.string.settings_live_preview_subtitle),
-                checked = previewVideo,
+                subtitle = if (liteMode) stringResource(R.string.settings_live_preview_lite)
+                else stringResource(R.string.settings_live_preview_subtitle),
+                checked = previewVideo && !liteMode,
+                enabled = !liteMode,
                 onToggle = settings::setGuidePreviewVideo,
             )
             ToggleRow(
@@ -273,6 +298,7 @@ private val OpenTvLanguages: List<Pair<String, String>> = listOf(
     "de" to "Deutsch",
     "it" to "Italiano",
     "pt" to "Português",
+    "pt-BR" to "Português (Brasil)",
     "nl" to "Nederlands",
     "pl" to "Polski",
     "ru" to "Русский",
@@ -397,11 +423,12 @@ private fun ToggleRow(
     subtitle: String,
     checked: Boolean,
     onToggle: (Boolean) -> Unit,
+    enabled: Boolean = true,
 ) {
     Row(
         Modifier
             .fillMaxWidth()
-            .clickable { onToggle(!checked) },
+            .clickable(enabled = enabled) { onToggle(!checked) },
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Column(Modifier.weight(1f).widthIn(max = 640.dp)) {
@@ -413,7 +440,7 @@ private fun ToggleRow(
             )
         }
         Spacer(Modifier.width(16.dp))
-        Switch(checked = checked, onCheckedChange = onToggle)
+        Switch(checked = checked, onCheckedChange = onToggle, enabled = enabled)
     }
 }
 

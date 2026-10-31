@@ -5,6 +5,9 @@
  */
 package app.opentv.data.remote
 
+import android.util.JsonReader
+import android.util.JsonToken
+import app.opentv.core.CountingInputStream
 import app.opentv.data.model.Category
 import app.opentv.data.model.Channel
 import app.opentv.data.model.Episode
@@ -13,8 +16,15 @@ import app.opentv.data.model.Series
 import app.opentv.data.model.Source
 import app.opentv.data.model.StreamKind
 import java.io.InputStream
+import java.io.InputStreamReader
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.job
 import kotlinx.coroutines.withContext
+import kotlinx.serialization.json.JsonNull
+import kotlinx.serialization.json.buildJsonArray
+import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
@@ -25,6 +35,7 @@ import kotlinx.serialization.json.jsonObject
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.OkHttpClient
+import java.util.concurrent.TimeUnit
 import okhttp3.Request
 
 /**
@@ -45,6 +56,14 @@ class XtreamApi(
     private val http: OkHttpClient,
     private val json: Json = Json { ignoreUnknownKeys = true; isLenient = true },
 ) {
+    /**
+     * Large JSON arrays (live, films, series) are read and written in batches. The shared
+     * client's five-minute call cap would close the socket halfway through.
+     */
+    private val downloadHttp = http.newBuilder()
+        .callTimeout(0, TimeUnit.MILLISECONDS)
+        .readTimeout(3, TimeUnit.MINUTES)
+        .build()
 
     class XtreamException(message: String, cause: Throwable? = null) : Exception(message, cause)
 
@@ -98,83 +117,117 @@ class XtreamApi(
         }
     }
 
-    suspend fun liveStreams(source: Source): List<Channel> = withContext(Dispatchers.IO) {
-        getJson(source, "get_live_streams").arrayOrEmpty.mapIndexedNotNull { index, element ->
-            val obj = element.jsonObjectOrNull ?: return@mapIndexedNotNull null
-            val streamId = obj["stream_id"].asStringOrNull ?: return@mapIndexedNotNull null
-            val name = obj["name"].asStringOrNull ?: return@mapIndexedNotNull null
-            Channel(
-                sourceId = source.id,
-                streamId = streamId,
-                name = name,
-                categoryId = obj["category_id"].asStringOrNull,
-                logoUrl = obj["stream_icon"].asStringOrNull?.takeIf { it.isNotBlank() },
-                // epg_channel_id is what joins to XMLTV; it is frequently blank, in which
-                // case the channel simply has no guide rather than the guide being broken.
-                epgChannelId = obj["epg_channel_id"].asStringOrNull?.takeIf { it.isNotBlank() },
-                tvArchive = obj["tv_archive"].asIntOrNull == 1,
-                tvArchiveDays = obj["tv_archive_duration"].asIntOrNull ?: 0,
-                number = obj["num"].asIntOrNull,
-                streamUrl = liveStreamUrl(source, streamId),
-                sortIndex = obj["num"].asIntOrNull ?: index,
-            )
+    /**
+     * Live channels, one object at a time. The JSON array is never materialised: a panel with
+     * hundreds of thousands of streams would not fit beside the rows already being written.
+     */
+    suspend fun streamLive(
+        source: Source,
+        onLength: (Long) -> Unit,
+        onBytes: (Long) -> Unit,
+        onChannel: suspend (Channel) -> Unit,
+    ) {
+        var index = 0
+        streamArray(source, "get_live_streams", onLength, onBytes) { obj ->
+            channelFrom(source, obj, index)?.let {
+                index++
+                onChannel(it)
+            }
         }
     }
 
-    suspend fun movies(source: Source): List<Movie> = withContext(Dispatchers.IO) {
-        getJson(source, "get_vod_streams").arrayOrEmpty.mapNotNull { element ->
-            val obj = element.jsonObjectOrNull ?: return@mapNotNull null
-            val streamId = obj["stream_id"].asStringOrNull ?: return@mapNotNull null
-            val name = obj["name"].asStringOrNull ?: return@mapNotNull null
-            val extension = obj["container_extension"].asStringOrNull?.takeIf { it.isNotBlank() }
-            Movie(
-                sourceId = source.id,
-                streamId = streamId,
-                name = name,
-                categoryId = obj["category_id"].asStringOrNull,
-                posterUrl = obj["stream_icon"].asStringOrNull?.takeIf { it.isNotBlank() },
-                rating = obj["rating"].asDoubleOrNull,
-                year = obj["year"].asIntOrNull,
-                plot = obj["plot"].asStringOrNull,
-                durationSeconds = obj["duration_secs"].asIntOrNull,
-                containerExtension = extension,
-                streamUrl = vodStreamUrl(source, streamId, extension),
-                addedMillis = obj["added"].asLongOrNull?.times(1000) ?: 0L,
-                // Rich metadata is best-effort here: the streams list carries it on some panels
-                // and not others. Whatever is missing is back-filled from get_vod_info on the
-                // first detail open. See asBackdropUrl for the array-or-string handling.
-                backdropUrl = obj.asBackdropUrl("movie_image", "cover_big"),
-                cast = obj["cast"].asStringOrNull ?: obj["actors"].asStringOrNull,
-                director = obj["director"].asStringOrNull,
-                genre = obj["genre"].asStringOrNull,
-                tmdbId = obj["tmdb_id"].asStringOrNull ?: obj["tmdb"].asStringOrNull,
-            )
+    /** Movies, one object at a time. See [streamLive]. */
+    suspend fun streamMovies(
+        source: Source,
+        onLength: (Long) -> Unit,
+        onBytes: (Long) -> Unit,
+        onMovie: suspend (Movie) -> Unit,
+    ) {
+        streamArray(source, "get_vod_streams", onLength, onBytes) { obj ->
+            movieFrom(source, obj)?.let { onMovie(it) }
         }
     }
 
-    suspend fun series(source: Source): List<Series> = withContext(Dispatchers.IO) {
-        getJson(source, "get_series").arrayOrEmpty.mapNotNull { element ->
-            val obj = element.jsonObjectOrNull ?: return@mapNotNull null
-            val seriesId = obj["series_id"].asStringOrNull ?: return@mapNotNull null
-            val name = obj["name"].asStringOrNull ?: return@mapNotNull null
-            Series(
-                sourceId = source.id,
-                seriesId = seriesId,
-                name = name,
-                categoryId = obj["category_id"].asStringOrNull,
-                posterUrl = obj["cover"].asStringOrNull?.takeIf { it.isNotBlank() },
-                rating = obj["rating"].asDoubleOrNull,
-                year = obj["year"].asIntOrNull ?: obj["releaseDate"].asStringOrNull?.take(4)?.toIntOrNull(),
-                plot = obj["plot"].asStringOrNull,
-                addedMillis = obj["last_modified"].asLongOrNull?.times(1000) ?: 0L,
-                // get_series carries most of this inline on the majority of panels; anything
-                // missing is back-filled from get_series_info on the first detail open.
-                backdropUrl = obj.asBackdropUrl("cover_big", "cover"),
-                cast = obj["cast"].asStringOrNull ?: obj["actors"].asStringOrNull,
-                genre = obj["genre"].asStringOrNull,
-                tmdbId = obj["tmdb_id"].asStringOrNull ?: obj["tmdb"].asStringOrNull,
-            )
+    /** Series, one object at a time. See [streamLive]. */
+    suspend fun streamSeries(
+        source: Source,
+        onLength: (Long) -> Unit,
+        onBytes: (Long) -> Unit,
+        onSeries: suspend (Series) -> Unit,
+    ) {
+        streamArray(source, "get_series", onLength, onBytes) { obj ->
+            seriesFrom(source, obj)?.let { onSeries(it) }
         }
+    }
+
+    private fun channelFrom(source: Source, obj: JsonObject, index: Int): Channel? {
+        val streamId = obj["stream_id"].asStringOrNull ?: return null
+        val name = obj["name"].asStringOrNull ?: return null
+        return Channel(
+            sourceId = source.id,
+            streamId = streamId,
+            name = name,
+            categoryId = obj["category_id"].asStringOrNull,
+            logoUrl = obj["stream_icon"].asStringOrNull?.takeIf { it.isNotBlank() },
+            // epg_channel_id is what joins to XMLTV; it is frequently blank, in which
+            // case the channel simply has no guide rather than the guide being broken.
+            epgChannelId = obj["epg_channel_id"].asStringOrNull?.takeIf { it.isNotBlank() },
+            tvArchive = obj["tv_archive"].asIntOrNull == 1,
+            tvArchiveDays = obj["tv_archive_duration"].asIntOrNull ?: 0,
+            number = obj["num"].asIntOrNull,
+            streamUrl = liveStreamUrl(source, streamId),
+            sortIndex = obj["num"].asIntOrNull ?: index,
+        )
+    }
+
+    private fun movieFrom(source: Source, obj: JsonObject): Movie? {
+        val streamId = obj["stream_id"].asStringOrNull ?: return null
+        val name = obj["name"].asStringOrNull ?: return null
+        val extension = obj["container_extension"].asStringOrNull?.takeIf { it.isNotBlank() }
+        return Movie(
+            sourceId = source.id,
+            streamId = streamId,
+            name = name,
+            categoryId = obj["category_id"].asStringOrNull,
+            posterUrl = obj["stream_icon"].asStringOrNull?.takeIf { it.isNotBlank() },
+            rating = obj["rating"].asDoubleOrNull,
+            year = obj["year"].asIntOrNull,
+            plot = obj["plot"].asStringOrNull,
+            durationSeconds = obj["duration_secs"].asIntOrNull,
+            containerExtension = extension,
+            streamUrl = vodStreamUrl(source, streamId, extension),
+            addedMillis = obj["added"].asLongOrNull?.times(1000) ?: 0L,
+            // Rich metadata is best-effort here: the streams list carries it on some panels
+            // and not others. Whatever is missing is back-filled from get_vod_info on the
+            // first detail open. See asBackdropUrl for the array-or-string handling.
+            backdropUrl = obj.asBackdropUrl("movie_image", "cover_big"),
+            cast = obj["cast"].asStringOrNull ?: obj["actors"].asStringOrNull,
+            director = obj["director"].asStringOrNull,
+            genre = obj["genre"].asStringOrNull,
+            tmdbId = obj["tmdb_id"].asStringOrNull ?: obj["tmdb"].asStringOrNull,
+        )
+    }
+
+    private fun seriesFrom(source: Source, obj: JsonObject): Series? {
+        val seriesId = obj["series_id"].asStringOrNull ?: return null
+        val name = obj["name"].asStringOrNull ?: return null
+        return Series(
+            sourceId = source.id,
+            seriesId = seriesId,
+            name = name,
+            categoryId = obj["category_id"].asStringOrNull,
+            posterUrl = obj["cover"].asStringOrNull?.takeIf { it.isNotBlank() },
+            rating = obj["rating"].asDoubleOrNull,
+            year = obj["year"].asIntOrNull ?: obj["releaseDate"].asStringOrNull?.take(4)?.toIntOrNull(),
+            plot = obj["plot"].asStringOrNull,
+            addedMillis = obj["last_modified"].asLongOrNull?.times(1000) ?: 0L,
+            // get_series carries most of this inline on the majority of panels; anything
+            // missing is back-filled from get_series_info on the first detail open.
+            backdropUrl = obj.asBackdropUrl("cover_big", "cover"),
+            cast = obj["cast"].asStringOrNull ?: obj["actors"].asStringOrNull,
+            genre = obj["genre"].asStringOrNull,
+            tmdbId = obj["tmdb_id"].asStringOrNull ?: obj["tmdb"].asStringOrNull,
+        )
     }
 
     /**
@@ -271,17 +324,22 @@ class XtreamApi(
         )
     }
 
-    /** Opens the XMLTV guide as a stream. The caller must close it. */
-    suspend fun openEpgStream(source: Source): InputStream = withContext(Dispatchers.IO) {
+    /** Opens the XMLTV guide as a stream. The caller must close it. [length] is the HTTP body size, or -1. */
+    suspend fun openEpgStream(source: Source): OpenedBody = withContext(Dispatchers.IO) {
         val url = source.epgUrl?.toHttpUrlOrNull() ?: xmltvUrl(source)
         val response = http.newCall(request(source, url)).execute()
         if (!response.isSuccessful) {
             response.close()
             throw XtreamException("Guide download failed (HTTP ${response.code}).")
         }
-        response.body?.byteStream()
-            ?: throw XtreamException("The server returned an empty guide.")
+        val body = response.body ?: run {
+            response.close()
+            throw XtreamException("The server returned an empty guide.")
+        }
+        OpenedBody(body.byteStream(), body.contentLength())
     }
+
+    class OpenedBody(val stream: InputStream, val length: Long)
 
     // ---- URL construction ----------------------------------------------------------------
 
@@ -313,6 +371,19 @@ class XtreamApi(
             .addQueryParameter("username", source.username.orEmpty())
             .addQueryParameter("password", source.password.orEmpty())
             .build()
+
+    /** Player-API URL for one action. Used to weigh a download before it starts. */
+    fun actionUrl(source: Source, action: String): HttpUrl =
+        baseUrl(source).newBuilder()
+            .encodedPath("/player_api.php")
+            .addQueryParameter("username", source.username.orEmpty())
+            .addQueryParameter("password", source.password.orEmpty())
+            .addQueryParameter("action", action)
+            .build()
+
+    /** The guide URL this source will actually be fetched from. */
+    fun guideUrl(source: Source): HttpUrl =
+        source.epgUrl?.toHttpUrlOrNull() ?: xmltvUrl(source)
 
     private fun baseUrl(source: Source): HttpUrl =
         source.url.toHttpUrlOrNull()
@@ -357,6 +428,79 @@ class XtreamApi(
             .url(url)
             .header("User-Agent", source.userAgent)
             .build()
+
+    /**
+     * Reads a player-API JSON array one object at a time. Anything that is not an array
+     * (an error object, an empty body) yields no items; the caller decides whether that is fatal.
+     */
+    private suspend fun streamArray(
+        source: Source,
+        action: String,
+        onLength: (Long) -> Unit,
+        onBytes: (Long) -> Unit,
+        onObject: suspend (JsonObject) -> Unit,
+    ) = withContext(Dispatchers.IO) {
+        val call = downloadHttp.newCall(request(source, actionUrl(source, action)))
+        currentCoroutineContext().job.invokeOnCompletion { cause ->
+            if (cause != null) call.cancel()
+        }
+        call.execute().use { response ->
+            if (!response.isSuccessful) {
+                throw XtreamException(describeHttpFailure(response.code))
+            }
+            val body = response.body ?: throw XtreamException("The server returned an empty response.")
+            onLength(body.contentLength())
+            val counting = CountingInputStream(body.byteStream(), onBytes)
+            try {
+                JsonReader(InputStreamReader(counting, Charsets.UTF_8)).use { reader ->
+                    if (!reader.hasNext() || reader.peek() != JsonToken.BEGIN_ARRAY) return@use
+                    reader.beginArray()
+                    while (reader.hasNext()) {
+                        val element = readElement(reader)
+                        val obj = element as? JsonObject ?: continue
+                        onObject(obj)
+                    }
+                    reader.endArray()
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: XtreamException) {
+                throw e
+            } catch (e: Exception) {
+                throw XtreamException(
+                    "The server replied with something that is not a valid catalogue. " +
+                        "Check the address and port are correct.",
+                    e,
+                )
+            }
+        }
+    }
+
+    private fun readElement(reader: JsonReader): JsonElement = when (reader.peek()) {
+        JsonToken.BEGIN_OBJECT -> buildJsonObject {
+            reader.beginObject()
+            while (reader.hasNext()) {
+                val name = reader.nextName()
+                put(name, readElement(reader))
+            }
+            reader.endObject()
+        }
+        JsonToken.BEGIN_ARRAY -> buildJsonArray {
+            reader.beginArray()
+            while (reader.hasNext()) add(readElement(reader))
+            reader.endArray()
+        }
+        JsonToken.STRING, JsonToken.NUMBER -> JsonPrimitive(reader.nextString())
+        JsonToken.BOOLEAN -> JsonPrimitive(reader.nextBoolean())
+        JsonToken.NULL -> {
+            reader.nextNull()
+            JsonNull
+        }
+        else -> {
+            reader.skipValue()
+            JsonNull
+        }
+    }
 
     private fun describeHttpFailure(code: Int): String = when (code) {
         401, 403 -> "The server refused the request (HTTP $code). The username or password " +

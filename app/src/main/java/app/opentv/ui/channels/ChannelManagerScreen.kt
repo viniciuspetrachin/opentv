@@ -22,6 +22,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Star
@@ -58,6 +59,7 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import app.opentv.R
 import app.opentv.data.model.shownName
 import app.opentv.ui.ChannelsViewModel
+import app.opentv.ui.rememberSizedImage
 import coil.compose.AsyncImage
 import kotlinx.coroutines.delay
 
@@ -211,6 +213,7 @@ fun ChannelManagerScreen(
                         onExitLeft = onExitLeftToRail,
                         onToggleHidden = { row, hidden -> viewModel.setRowHidden(row, !hidden) },
                         onToggleFavourite = { viewModel.toggleFavourite(it) },
+                        onNearEnd = viewModel::loadMoreManagerChannels,
                     )
                 }
             }
@@ -263,6 +266,7 @@ private fun BrowsePane(
     onExitLeft: () -> Boolean,
     onToggleHidden: (ChannelsViewModel.Row, Boolean) -> Unit,
     onToggleFavourite: (ChannelsViewModel.Row) -> Unit,
+    onNearEnd: () -> Unit,
 ) {
     when {
         !hasCategories -> Hint(stringResource(R.string.channels_manager_no_channels))
@@ -272,7 +276,10 @@ private fun BrowsePane(
             modifier = Modifier.fillMaxSize(),
             verticalArrangement = Arrangement.spacedBy(6.dp),
         ) {
-            items(rows, key = { it.key }) { row ->
+            itemsIndexed(rows, key = { _, row -> row.key }) { index, row ->
+                if (index == rows.lastIndex) {
+                    LaunchedEffect(rows.size) { onNearEnd() }
+                }
                 val hidden = row.variants.all { it.hidden }
                 ManagerRow(
                     row = row,
@@ -361,7 +368,7 @@ private fun ManagerRow(
         verticalAlignment = Alignment.CenterVertically,
     ) {
         AsyncImage(
-            model = row.primary.logoUrl,
+            model = rememberSizedImage(row.primary.logoUrl, 40.dp, 40.dp),
             contentDescription = null,
             modifier = Modifier.size(40.dp).clip(RoundedCornerShape(6.dp)),
         )

@@ -16,6 +16,7 @@ import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.PeriodicWorkRequestBuilder
 import androidx.work.WorkManager
 import androidx.work.WorkerParameters
+import app.opentv.core.CatalogueLoad
 import app.opentv.core.ServiceLocator
 import app.opentv.data.repo.CatalogRepository
 import java.util.concurrent.TimeUnit
@@ -39,31 +40,39 @@ class SyncWorker(
         if (sources.isEmpty()) return Result.success()
 
         var anyFailed = false
-
-        for (source in sources) {
-            when (val result = graph.catalogRepository.sync(source, now)) {
-                is CatalogRepository.SyncResult.Success ->
-                    Log.i(TAG, "Catalogue for ${source.name}: ${result.channelCount} channels")
-                is CatalogRepository.SyncResult.Failed -> {
-                    anyFailed = true
-                    Log.w(TAG, "Catalogue for ${source.name} failed: ${result.reason}")
+        var ran = false
+        try {
+            ran = CatalogueLoad.tryRun { meter ->
+                val live = graph.settings.liveEnabled.value
+                for (source in sources) {
+                    graph.catalogRepository.planLoad(source, meter, includeLive = live, includeVod = true)
                 }
+                graph.epgRepository.plan(meter, now, force = false)
+                for (source in sources) {
+                    when (val result = graph.catalogRepository.sync(source, now, meter)) {
+                        is CatalogRepository.SyncResult.Success ->
+                            Log.i(TAG, "Catalogue for ${source.name}: ${result.channelCount} channels")
+                        is CatalogRepository.SyncResult.Failed -> {
+                            anyFailed = true
+                            Log.w(TAG, "Catalogue for ${source.name} failed: ${result.reason}")
+                        }
+                    }
+                }
+                val summary = graph.epgRepository.syncAll(now, meter = meter)
+                if (summary.feedsFailed > 0) anyFailed = true
+                Log.i(
+                    TAG,
+                    "Guide: ${summary.programmesWritten} programmes from ${summary.feedsSucceeded} " +
+                        "feed(s), ${summary.channelsMatched}/${summary.channelsTotal} channels matched",
+                )
+                runCatching { graph.recordingEngine.rescanSeriesRules() }
             }
-
+        } catch (t: Throwable) {
+            if (t is kotlinx.coroutines.CancellationException) throw t
+            Log.e(TAG, "Sync failed", t)
+            return Result.retry()
         }
-
-        // Guides sync as one pass across every enabled feed — provider guides, built-in
-        // free sources and user URLs merge into a single guide, then the matcher runs.
-        val summary = graph.epgRepository.syncAll(now)
-        if (summary.feedsFailed > 0) anyFailed = true
-        Log.i(
-            TAG,
-            "Guide: ${summary.programmesWritten} programmes from ${summary.feedsSucceeded} " +
-                "feed(s), ${summary.channelsMatched}/${summary.channelsTotal} channels matched",
-        )
-
-        // Book any newly-revealed series-link airings from this fresh guide.
-        runCatching { graph.recordingEngine.rescanSeriesRules() }
+        if (!ran) return Result.success()
 
         // A partial failure is still a retry — but the user keeps everything already on disk.
         return if (anyFailed) Result.retry() else Result.success()
