@@ -12,13 +12,21 @@ Everything lives in a SQLite database in the app's private storage on your devic
 - The guide (EPG)
 - Your favourites, hidden channels and resume positions
 
-None of it is uploaded anywhere. There is no account to create and no server to sync with.
+None of it is uploaded to a server the project runs. There is no account.
+
+If you turn on sync, a bundle goes to another OpenTV device on your own network, or to a folder
+on a NAS you configured for recordings. The bundle is favourites, hidden channels, resume
+positions, profile names and NAS recording locators. The provider username and password are not
+in it.
 
 ## Who your device talks to
 
-Only your provider, and only at the address you entered. Channel logos and posters are fetched
-from whatever URLs your provider puts in its catalogue, which are usually its own servers but
-may be third parties — that is your provider's choice, not ours.
+Your provider, at the address you entered. Channel logos and posters are fetched from whatever
+URLs your provider puts in its catalogue, which are usually its own servers but may be third
+parties — that is your provider's choice, not ours.
+
+Phone pairing, the on-TV channel manager and device sync talk to another device on your LAN, or
+to the NAS address you entered. The project does not see that traffic.
 
 ## Cleartext HTTP
 

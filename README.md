@@ -96,7 +96,7 @@ is public — you can check the APK against the source, or rebuild it yourself, 
 trusting anyone's word.
 
 New to this? [SETUP.md](SETUP.md) walks through getting the repo, the install page and the
-first build running.
+first build running. The rest of the docs are indexed in [docs/README.md](docs/README.md).
 
 ## Build it yourself
 

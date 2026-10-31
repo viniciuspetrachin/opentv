@@ -7,15 +7,20 @@ particular the ones made in direct response to how apps in this category typical
 
 ```
 app/src/main/java/app/opentv/
-├── core/           ServiceLocator — the whole dependency graph, one file
+├── core/           ServiceLocator, settings, memory, load tracing
 ├── data/
 │   ├── model/      Domain models, which double as Room entities
 │   ├── db/         Room database and DAOs
-│   ├── remote/     XtreamApi — the provider panel client
-│   ├── parser/     M3uParser, XmltvParser — pure, streaming, heavily tested
-│   ├── repo/       SourceRepository, CatalogRepository, EpgRepository
+│   ├── remote/     Xtream, Stalker, Stremio, TMDB, GitHub releases
+│   ├── parser/     M3uParser, XmltvParser, M3uGroups
+│   ├── repo/       Catalogue, EPG, sources, recordings, reminders
 │   └── work/       SyncWorker — periodic background refresh
-├── player/         PlayerController, PlaybackErrors
+├── player/         PlayerController, errors, SMB and growing recordings
+├── recording/      DVR engine, scheduler, local and SMB storage
+├── reminders/      Programme alarms
+├── pairing/        On-device pages for phone setup and the channel manager
+├── sync/           LAN and NAS bundles. No project server
+├── update/         GitHub release check and APK install
 └── ui/             Compose screens and view models
 ```
 
@@ -23,13 +28,17 @@ Single module, single Gradle build. A multi-module setup would build faster in C
 a team of ten would do. This is not a team of ten; it is a project whose survival depends on a
 stranger with a broken channel being able to find the relevant code in under five minutes.
 
-## No backend. At all.
+## No project server.
 
-OpenTV has no server. There is no account, no login, no cloud sync, no web dashboard for
-editing your channel list from a browser.
+OpenTV has no server of its own. There is no account and no login to the project.
+
+Two things that look like a backend are not one. The television runs a small HTTP server on the
+LAN so a phone can type a provider login or edit the channel list. Sync exchanges a bundle with
+another device on that LAN, or writes a JSON file into a folder on a NAS the user already
+configured. Provider credentials are not in the bundle (`sync/SyncData.kt`).
 
 This is the single most important architectural decision in the project, and it is worth being
-explicit about why, because a web dashboard is a genuinely nice feature and users ask for it.
+explicit about why, because a hosted dashboard is a genuinely nice feature and users ask for it.
 
 **A cloud dashboard has to be paid for every month, forever, per user.** An app funded by a
 one-off payment or by donations cannot carry that. Every player that has tried has arrived at
@@ -40,8 +49,10 @@ service that no longer exists.
 
 So OpenTV stores everything on the device, in SQLite. The consequences are accepted honestly:
 
-- Setting up a second TV means entering your details again. This is a real cost.
-- Favourites and channel ordering do not follow you between devices.
+- A second TV still needs the provider login typed again. Credentials are the one thing that
+  does not sync.
+- Favourites, hidden channels, resume positions and NAS recordings can follow you, but only
+  through a device or a NAS you control. If that copy is gone, the project has nothing to restore.
 
 And what is bought with it:
 
@@ -49,9 +60,8 @@ And what is bought with it:
 - Provider credentials never leave the device. Nobody has to trust the maintainers with them.
 - It works with no internet connection to anything except your own provider.
 
-If multi-device setup becomes painful enough, the answer is **export/import of a settings file**
-— or, at most, optional sync through storage the *user* already owns and pays for. Never a
-service the project has to fund.
+Sync between devices, when the user turns it on, goes through the LAN or through storage the
+user already owns. Never a service the project has to fund.
 
 ## The EPG, and why it is written the way it is
 
@@ -94,10 +104,11 @@ yours" bug.
 `favourite`, `hidden` and `sortIndex` across to the incoming rows by `streamId`, upserts, and
 only then deletes channels the provider no longer lists.
 
-This is why `M3uParser` works so hard to produce a **stable** `streamId` for playlists with no
-`tvg-id` — an FNV-1a hash of the URL rather than `String.hashCode()`. An unstable id means
-every refresh looks like a completely new set of channels, and the user's favourites silently
-vanish.
+This is why `M3uParser` produces a **stable** `streamId`. A row with `xui-id` is `xui:<id>`.
+Otherwise the id is `url:` plus an FNV-1a hash of the stream URL, not `String.hashCode()` and
+not `tvg-id`. Affiliates often share a `tvg-id`; using it as the row identity would collapse
+them. An unstable id means every refresh looks like a completely new set of channels, and the
+user's favourites silently vanish.
 
 ## SQLite's bound-variable limit is a real constraint here
 
@@ -175,6 +186,58 @@ deliberately not used: it adds an annotation processor, a build-time graph and a
 message that is genuinely hard to read, in exchange for wiring about a dozen objects. For a
 project hoping for drive-by contributions from people fixing their own bugs, "you can read the
 whole graph in one file" is worth more than the ceremony.
+
+## Large catalogues
+
+A playlist of a few hundred thousand lines does not fit in the heap of a cheap stick, and a
+`LazyColumn` does not help if the `List` behind it is already the whole table. `MemoryGovernor`
+never turns on `largeHeap`. The ceiling is the same `ChannelsViewModel.GUIDE_LIST_CAP` (2 000
+rows) for the guide, the channel manager and the movie and series shelves.
+
+### Import
+
+`M3uParser.parse` reads a `BufferedReader` and calls back one channel at a time. Attributes are
+taken with `indexOf`, not a `Regex` per line. Duplicate stream ids are filtered with a
+`LongOpenSet` of 64-bit hashes. `CatalogRepository.syncM3u` writes batches of
+`CATALOGUE_BATCH` (300, under SQLite's old 999-variable cap) and calls `deleteStale` only after
+the last batch succeeds. `OutOfMemoryError` becomes `SyncResult.Failed`. It is not rethrown onto
+the main thread, and rows already written stay.
+
+Xtream live, movies and series use the same batch size and the same stale-delete-after-success
+rule. Stalker live still builds the full list and calls `replaceCatalogue`. A portal the size of
+these M3U files would not survive that path.
+
+Progress is `OpenTV.Load` and `files/load-trace.log`. Do not log the playlist URL. The user and
+password are on the query string.
+
+### Where an M3U group is filed
+
+The channel row stays in `channels`. Only `categories.kind` changes, in `M3uGroups.kindOf`:
+
+- A name that starts with `FILMES` or `FILME` is `MOVIE`. `SERIES`, `SÉRIES` or `SERIE` is
+  `SERIES`. Everything else is `LIVE`.
+- A name that contains `24H`, `24 H` or `24 HORAS`, and a name that starts as films and also
+  mentions series (`Filmes e Séries`), stays `LIVE`. Those are television channels.
+- A leading `♦️` (`U+2666` or `U+25C6`) is a decorated copy of another shelf. `kindOf` returns
+  null and the category is not stored.
+
+`repairLiveCategories` runs when the guide view model starts, including when live categories
+already exist, so an older database is reclassified without a full re-download. The category
+primary key includes `kind`, so a correction deletes the old row and inserts the new one.
+
+Movies and Series read those channels when the category has channel rows. The poster is the
+channel name and logo. The click opens the live player, not the Xtream detail page. An Xtream
+category, whose rows are in `movies` or `series`, pages by `(addedMillis, id)` and still opens
+the detail page. Episodes are fetched when a series is opened, not during catalogue sync.
+
+The Series tab must not `COUNT` every series category at once when the `series` table is empty.
+That count is what used to fail and leave the tab blank. One category is enough to decide the
+shelf is there. `loadHomeFeeds` uses bounded genre queries. It does not `SELECT` the library.
+
+Above the cap, the guide does not subscribe to All. It selects the first category once. A
+category over the cap is paged with the cursor `(sortIndex, id)`, first page `afterSort =
+Int.MIN_VALUE` and `afterId = -1`. The channel manager uses the same cursor and includes hidden
+rows. The EPG matcher walks `pageAfterId` in pages of 500.
 
 ## Testing
 
